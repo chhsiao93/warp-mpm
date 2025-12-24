@@ -242,7 +242,6 @@ def torch2warp_quat(t, copy=False, dtype=warp.types.float32, dvc="cuda:0"):
         dtype=wp.quat,
         shape=t.shape[0],
         copy=False,
-        owner=False,
         requires_grad=t.requires_grad,
         # device=t.device.type)
         device=dvc,
@@ -261,7 +260,6 @@ def torch2warp_float(t, copy=False, dtype=warp.types.float32, dvc="cuda:0"):
         dtype=warp.types.float32,
         shape=t.shape[0],
         copy=False,
-        owner=False,
         requires_grad=t.requires_grad,
         # device=t.device.type)
         device=dvc,
@@ -281,7 +279,6 @@ def torch2warp_vec3(t, copy=False, dtype=warp.types.float32, dvc="cuda:0"):
         dtype=wp.vec3,
         shape=t.shape[0],
         copy=False,
-        owner=False,
         requires_grad=t.requires_grad,
         # device=t.device.type)
         device=dvc,
@@ -302,7 +299,6 @@ def torch2warp_mat33(t, copy=False, dtype=warp.types.float32, dvc="cuda:0"):
         dtype=wp.mat33,
         shape=t.shape[0],
         copy=False,
-        owner=False,
         requires_grad=t.requires_grad,
         # device=t.device.type)
         device=dvc,
