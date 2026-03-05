@@ -53,7 +53,7 @@ end_header
 """
         f.write(str.encode(header))
         f.write(position.tobytes())
-        print("write", filename)
+        # print("write", filename)
 
 def particle_position_tensor_to_ply(position_tensor, filename):
     # position is (n,3)
