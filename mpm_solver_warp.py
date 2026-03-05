@@ -557,7 +557,13 @@ class MPM_Simulator_WARP:
                 tensor_C = tensor_C.clone().detach()
             tensor_C = torch.reshape(tensor_C, (-1, 3, 3))  # arranged by rowmajor
             self.mpm_state.particle_C = torch2warp_mat33(tensor_C, dvc=device)
-
+            
+    def import_particle_selection_from_torch(self, tensor_selection, clone=True, device="cuda:0"):
+        if tensor_selection is not None:
+            if clone:
+                tensor_selection = tensor_selection.clone().detach()
+            self.mpm_state.particle_selection = torch2warp_int(tensor_selection, dvc=device)
+            
     def export_particle_x_to_torch(self):
         return wp.to_torch(self.mpm_state.particle_x)
 
@@ -609,7 +615,9 @@ class MPM_Simulator_WARP:
 
         cov = wp.to_torch(self.mpm_state.particle_cov)
         return cov
-
+    def export_particle_selection_to_torch(self):
+        selection_tensor = wp.to_torch(self.mpm_state.particle_selection)
+        return selection_tensor
     def print_time_profile(self):
         print("MPM Time profile:")
         for key, value in self.time_profile.items():
@@ -1005,6 +1013,66 @@ class MPM_Simulator_WARP:
         
         self.particle_velocity_modifiers.append(modify_particle_v_before_p2g)
         
+
+    # Add a point cloud as a static collider.
+    # point_cloud_np: numpy array of shape (N, 3) with positions in world coordinates.
+    # padding: number of grid cells to dilate around each occupied cell (fills gaps in sparse clouds).
+    def add_point_cloud_collider(self, point_cloud_np, padding=1, start_time=0.0, end_time=999.0, device="cuda:0"):
+        import numpy as np
+
+        n_grid = self.mpm_model.n_grid
+        inv_dx = self.mpm_model.inv_dx
+
+        # Convert point positions to grid indices
+        indices = (point_cloud_np * inv_dx).astype(np.int32)
+        indices = np.clip(indices, 0, n_grid - 1)
+
+        # Build occupancy grid
+        occupancy = np.zeros((n_grid, n_grid, n_grid), dtype=np.int32)
+        occupancy[indices[:, 0], indices[:, 1], indices[:, 2]] = 1
+
+        # Dilate occupancy to fill gaps (without wrap-around)
+        if padding > 0:
+            for _ in range(padding):
+                dilated = occupancy.copy()
+                for axis in range(3):
+                    slices_src = [slice(None)] * 3
+                    slices_dst = [slice(None)] * 3
+                    slices_src[axis] = slice(0, -1)
+                    slices_dst[axis] = slice(1, None)
+                    dilated[tuple(slices_dst)] |= occupancy[tuple(slices_src)]
+                    slices_src = [slice(None)] * 3
+                    slices_dst = [slice(None)] * 3
+                    slices_src[axis] = slice(1, None)
+                    slices_dst[axis] = slice(0, -1)
+                    dilated[tuple(slices_dst)] |= occupancy[tuple(slices_src)]
+                occupancy = dilated
+
+        num_occupied = int(occupancy.sum())
+        print(f"Point cloud collider: {len(point_cloud_np)} points -> {num_occupied} occupied grid cells (padding={padding})")
+
+        collider_param = PointCloudCollider()
+        collider_param.occupancy_grid = wp.from_numpy(occupancy, dtype=int, device=device)
+        collider_param.start_time = start_time
+        collider_param.end_time = end_time
+
+        self.collider_params.append(collider_param)
+
+        @wp.kernel
+        def collide(
+            time: float,
+            dt: float,
+            state: MPMStateStruct,
+            model: MPMModelStruct,
+            param: PointCloudCollider,
+        ):
+            grid_x, grid_y, grid_z = wp.tid()
+            if time >= param.start_time and time < param.end_time:
+                if param.occupancy_grid[grid_x, grid_y, grid_z] == 1:
+                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+
+        self.grid_postprocess.append(collide)
+        self.modify_bc.append(None)
 
     # given normal direction, say [0,0,1]
     # gradually release grid velocities from start position to end position

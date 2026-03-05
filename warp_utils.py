@@ -102,7 +102,13 @@ class Dirichlet_collider:
     horizontal_axis_1: wp.vec3
     horizontal_axis_2: wp.vec3
     half_height_and_radius: wp.vec2
-    
+
+@wp.struct
+class PointCloudCollider:
+    occupancy_grid: wp.array(dtype=int, ndim=3)
+    start_time: float
+    end_time: float
+
 
 
 @wp.struct
@@ -240,6 +246,24 @@ def torch2warp_quat(t, copy=False, dtype=warp.types.float32, dvc="cuda:0"):
     a = warp.types.array(
         ptr=t.data_ptr(),
         dtype=wp.quat,
+        shape=t.shape[0],
+        copy=False,
+        requires_grad=t.requires_grad,
+        # device=t.device.type)
+        device=dvc,
+    )
+    a.tensor = t
+    return a
+
+def torch2warp_int(t, copy=False, dtype=warp.types.int32, dvc="cuda:0"):
+    assert t.is_contiguous()
+    if t.dtype != torch.float32 and t.dtype != torch.int32:
+        raise RuntimeError(
+            "Error aliasing Torch tensor to Warp array. Torch tensor must be float32 or int32 type"
+        )
+    a = warp.types.array(
+        ptr=t.data_ptr(),
+        dtype=warp.types.int32,
         shape=t.shape[0],
         copy=False,
         requires_grad=t.requires_grad,
