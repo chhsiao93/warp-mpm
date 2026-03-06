@@ -84,7 +84,7 @@ def kirchoff_stress_drucker_prager(
 
 
 @wp.func
-def von_mises_return_mapping(F_trial: wp.mat33, model: MPMModelStruct, p: int):
+def von_mises_return_mapping(F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int):
     U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     sig_old = wp.vec3(0.0)
@@ -120,9 +120,9 @@ def von_mises_return_mapping(F_trial: wp.mat33, model: MPMModelStruct, p: int):
             wp.exp(epsilon[2]),
         )
         F_elastic = U * sig_elastic * wp.transpose(V)
-        if model.hardening == 1:
+        if model.hardening[mat] > 0.5:
             model.yield_stress[p] = (
-                model.yield_stress[p] + 2.0 * model.mu[p] * model.xi * delta_gamma
+                model.yield_stress[p] + 2.0 * model.mu[p] * model.xi[mat] * delta_gamma
             )
         return F_elastic
     else:
@@ -130,7 +130,7 @@ def von_mises_return_mapping(F_trial: wp.mat33, model: MPMModelStruct, p: int):
 
 @wp.func
 def von_mises_return_mapping_with_damage(
-    F_trial: wp.mat33, model: MPMModelStruct, p: int
+    F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int
 ):
     U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -157,7 +157,7 @@ def von_mises_return_mapping_with_damage(
         epsilon_hat_norm = wp.length(epsilon_hat) + 1e-6
         delta_gamma = epsilon_hat_norm - model.yield_stress[p] / (2.0 * model.mu[p])
         epsilon = epsilon - (delta_gamma / epsilon_hat_norm) * epsilon_hat
-        model.yield_stress[p] = model.yield_stress[p] - model.softening * wp.length(
+        model.yield_stress[p] = model.yield_stress[p] - model.softening[mat] * wp.length(
             (delta_gamma / epsilon_hat_norm) * epsilon_hat
         )
         if model.yield_stress[p] <= 0:
@@ -175,9 +175,9 @@ def von_mises_return_mapping_with_damage(
             wp.exp(epsilon[2]),
         )
         F_elastic = U * sig_elastic * wp.transpose(V)
-        if model.hardening == 1:
+        if model.hardening[mat] > 0.5:
             model.yield_stress[p] = (
-                model.yield_stress[p] + 2.0 * model.mu[p] * model.xi * delta_gamma
+                model.yield_stress[p] + 2.0 * model.mu[p] * model.xi[mat] * delta_gamma
             )
         return F_elastic
     else:
@@ -187,7 +187,7 @@ def von_mises_return_mapping_with_damage(
 # for toothpaste
 @wp.func
 def viscoplasticity_return_mapping_with_StVK(
-    F_trial: wp.mat33, model: MPMModelStruct, p: int, dt: float
+    F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int, dt: float
 ):
     U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -209,7 +209,7 @@ def viscoplasticity_return_mapping_with_StVK(
     if y > 0:
         mu_hat = model.mu[p] * (b_trial[0] + b_trial[1] + b_trial[2]) / 3.0
         s_new_norm = s_trial_norm - y / (
-            1.0 + model.plastic_viscosity / (2.0 * mu_hat * dt)
+            1.0 + model.plastic_viscosity[mat] / (2.0 * mu_hat * dt)
         )
         s_new = (s_new_norm / s_trial_norm) * s_trial
         epsilon_new = 1.0 / (2.0 * model.mu[p]) * s_new + wp.vec3(
@@ -234,7 +234,7 @@ def viscoplasticity_return_mapping_with_StVK(
 
 @wp.func
 def sand_return_mapping(
-    F_trial: wp.mat33, state: MPMStateStruct, model: MPMModelStruct, p: int
+    F_trial: wp.mat33, state: MPMStateStruct, model: MPMModelStruct, p: int, mat: int
 ):
     U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -255,7 +255,7 @@ def sand_return_mapping(
         + (3.0 * model.lam[p] + 2.0 * model.mu[p])
         / (2.0 * model.mu[p])
         * tr
-        * model.alpha
+        * model.alpha[mat]
     )
 
     if delta_gamma <= 0:
@@ -275,13 +275,9 @@ def sand_return_mapping(
 @wp.kernel
 def compute_mu_lam_from_E_nu(state: MPMStateStruct, model: MPMModelStruct):
     p = wp.tid()
-    model.mu[p] = model.E[p] / (2.0 * (1.0 + model.nu[p]))
-    model.lam[p] = model.E[p] * model.nu[p]  / ((1.0 + model.nu[p]) * (1.0 - 2.0 * model.nu[p]))
-
-@wp.kernel
-def compute_bulk(state:MPMStateStruct, model:MPMModelStruct):
-    p = wp.tid()
-    model.bulk[p] = model.lam[p] + 2./3. * model.mu[p]
+    mat = state.particle_material[p]
+    model.mu[p] = model.E[mat] / (2.0 * (1.0 + model.nu[mat]))
+    model.lam[p] = model.E[mat] * model.nu[mat] / ((1.0 + model.nu[mat]) * (1.0 - 2.0 * model.nu[mat]))
 
 @wp.kernel
 def zero_grid(state: MPMStateStruct, model: MPMModelStruct):
@@ -404,6 +400,8 @@ def grid_normalization_and_gravity(
 def g2p(state: MPMStateStruct, model: MPMModelStruct, dt: float):
     p = wp.tid()
     if state.particle_selection[p] == 0:
+        if state.particle_material[p] == 7:  # stationary particles don't move
+            return
         grid_pos = state.particle_x[p] * model.inv_dx
         base_pos_x = wp.int(grid_pos[0] - 0.5)
         base_pos_y = wp.int(grid_pos[1] - 0.5)
@@ -457,28 +455,32 @@ def compute_stress_from_F_trial(
 ):
     p = wp.tid()
     if state.particle_selection[p] == 0:
+        mat = state.particle_material[p]
+
         # apply return mapping
-        if model.material == 1:  # metal
+        if mat == 1:  # metal
             state.particle_F[p] = von_mises_return_mapping(
-                state.particle_F_trial[p], model, p
+                state.particle_F_trial[p], model, p, mat
             )
-        elif model.material == 2:  # sand
+        elif mat == 2:  # sand
             state.particle_F[p] = sand_return_mapping(
-                state.particle_F_trial[p], state, model, p
+                state.particle_F_trial[p], state, model, p, mat
             )
-        elif model.material == 3:  # visplas, with StVk+VM, no thickening
+        elif mat == 3:  # visplas, with StVk+VM, no thickening
             state.particle_F[p] = viscoplasticity_return_mapping_with_StVK(
-                state.particle_F_trial[p], model, p, dt
+                state.particle_F_trial[p], model, p, mat, dt
             )
-        elif model.material == 5:
+        elif mat == 5:  # plasticine
             state.particle_F[p] = von_mises_return_mapping_with_damage(
-                state.particle_F_trial[p], model, p
+                state.particle_F_trial[p], model, p, mat
             )
-        elif model.material == 6:  # fluid
+        elif mat == 6:  # fluid
             J = wp.determinant(state.particle_F_trial[p])
             Jcbr = J**(1.0 / 3.0)
             state.particle_F[p] = wp.mat33(Jcbr, 0.0, 0.0, 0.0, Jcbr, 0.0, 0.0, 0.0, Jcbr)
-        else:
+        elif mat == 7:  # stationary
+            state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        else:  # jelly (0), snow (4), or custom
             state.particle_F[p] = state.particle_F_trial[p]
 
         # also compute stress here
@@ -488,26 +490,26 @@ def compute_stress_from_F_trial(
         sig = wp.vec3(0.0)
         stress = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         wp.svd3(state.particle_F[p], U, sig, V)
-        if model.material == 0 or model.material == 5:
+        if mat == 0 or mat == 5:
             stress = kirchoff_stress_FCR(
                 state.particle_F[p], U, V, J, model.mu[p], model.lam[p]
             )
-        if model.material == 1:
+        if mat == 1:
             stress = kirchoff_stress_StVK(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
-        if model.material == 2:
+        if mat == 2:
             stress = kirchoff_stress_drucker_prager(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
-        if model.material == 3:
+        if mat == 3:
             # temporarily use stvk, subject to change
             stress = kirchoff_stress_StVK(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
-        if model.material == 6: # fluid
+        if mat == 6:  # fluid
             stress = kirchoff_stress_water(
-                J, model.bulk[p]
+                J, model.bulk[mat]
             )
 
         stress = (stress + wp.transpose(stress)) / 2.0  # enfore symmetry
@@ -575,6 +577,9 @@ def add_damping_via_grid(state: MPMStateStruct, scale: float):
     )
 
 
+# NOTE: E and nu are now per-type (indexed by material type, not particle).
+# To use different E/nu for a region, define a new material type and use
+# set_parameters_for_particles() instead.
 @wp.kernel
 def apply_additional_params(
     state: MPMStateStruct,
@@ -591,8 +596,6 @@ def apply_additional_params(
         and pos[2] > params_modifier.point[2] - params_modifier.size[2]
         and pos[2] < params_modifier.point[2] + params_modifier.size[2]
     ):
-        model.E[p] = params_modifier.E
-        model.nu[p] = params_modifier.nu
         state.particle_density[p] = params_modifier.density
 
 

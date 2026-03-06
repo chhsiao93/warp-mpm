@@ -35,11 +35,14 @@ def save_data_at_frame(mpm_solver, dir_name, frame, save_to_ply = True, save_to_
         newFile.create_dataset("C", data=C_np) # particle C
         print("save siumlation data at frame ", frame, " to ", fullfilename)
 
-def particle_position_to_ply(mpm_solver, filename):
+def particle_position_to_ply(mpm_solver, filename, hide_unselected = True):
     # position is (n,3)
     if os.path.exists(filename):
         os.remove(filename)
     position = mpm_solver.mpm_state.particle_x.numpy()
+    if hide_unselected:
+        selection = mpm_solver.mpm_state.particle_selection.numpy()
+        position = position[selection == 0] # only keep active particles
     num_particles = (position).shape[0]
     position = position.astype(np.float32)
     with open(filename, 'wb') as f: # write binary

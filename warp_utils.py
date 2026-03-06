@@ -24,12 +24,12 @@ class MPMModelStruct:
     ######## for plasticity ####
     yield_stress: wp.array(dtype=float)
     friction_angle: float
-    alpha: float
+    alpha: wp.array(dtype=float)
     gravitational_accelaration: wp.vec3
-    hardening: float
-    xi: float
-    plastic_viscosity: float
-    softening: float
+    hardening: wp.array(dtype=float)
+    xi: wp.array(dtype=float)
+    plastic_viscosity: wp.array(dtype=float)
+    softening: wp.array(dtype=float)
 
     ####### for damping
     rpic_damping: float
@@ -60,6 +60,7 @@ class MPMStateStruct:
     particle_Jp: wp.array(dtype=float)
 
     particle_selection: wp.array(dtype=int) # only particle_selection[p] = 0 will be simulated
+    particle_material: wp.array(dtype=int)  # material type per particle (0=jelly,1=metal,2=sand,3=foam,4=snow,5=plasticine,6=fluid)
 
     # grid
     grid_m: wp.array(dtype=float, ndim=3)
@@ -222,6 +223,12 @@ def add_vec3_to_vec3(
 
 @wp.kernel
 def set_value_to_float_array(target_array: wp.array(dtype=float), value: float):
+    tid = wp.tid()
+    target_array[tid] = value
+
+
+@wp.kernel
+def set_value_to_int_array(target_array: wp.array(dtype=int), value: int):
     tid = wp.tid()
     target_array[tid] = value
 
