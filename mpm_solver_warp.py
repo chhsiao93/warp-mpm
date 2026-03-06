@@ -569,6 +569,14 @@ class MPM_Simulator_WARP:
 
     def export_particle_v_to_torch(self):
         return wp.to_torch(self.mpm_state.particle_v)
+    
+    def export_particle_vol_to_torch(self):
+        return wp.to_torch(self.mpm_state.particle_vol)
+    
+    def export_particle_stress_to_torch(self):
+        stress_tensor = wp.to_torch(self.mpm_state.particle_stress)
+        stress_tensor = stress_tensor.reshape(-1, 9)
+        return stress_tensor
 
     def export_particle_F_to_torch(self):
         F_tensor = wp.to_torch(self.mpm_state.particle_F)
@@ -618,6 +626,16 @@ class MPM_Simulator_WARP:
     def export_particle_selection_to_torch(self):
         selection_tensor = wp.to_torch(self.mpm_state.particle_selection)
         return selection_tensor
+    def export_grid_v_out_to_torch(self):
+        grid_v_tensor = wp.to_torch(self.mpm_state.grid_v_out)
+        return grid_v_tensor
+    def export_grid_v_in_to_torch(self):
+        grid_v_tensor = wp.to_torch(self.mpm_state.grid_v_in)
+        return grid_v_tensor
+    def export_grid_m_to_torch(self):
+        grid_m_tensor = wp.to_torch(self.mpm_state.grid_m)
+        return grid_m_tensor
+    
     def print_time_profile(self):
         print("MPM Time profile:")
         for key, value in self.time_profile.items():
@@ -714,7 +732,7 @@ class MPM_Simulator_WARP:
                                 v
                             )  # apply friction here
                         state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                            0.0, 0.0, 0.0
+                            v[0], v[1], v[2]
                         )
 
         self.grid_postprocess.append(collide)

@@ -474,7 +474,11 @@ def compute_stress_from_F_trial(
             state.particle_F[p] = von_mises_return_mapping_with_damage(
                 state.particle_F_trial[p], model, p
             )
-        else:  # elastic
+        elif model.material == 6:  # fluid
+            J = wp.determinant(state.particle_F_trial[p])
+            Jcbr = J**(1.0 / 3.0)
+            state.particle_F[p] = wp.mat33(Jcbr, 0.0, 0.0, 0.0, Jcbr, 0.0, 0.0, 0.0, Jcbr)
+        else:
             state.particle_F[p] = state.particle_F_trial[p]
 
         # also compute stress here
