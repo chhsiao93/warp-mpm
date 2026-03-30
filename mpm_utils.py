@@ -400,7 +400,7 @@ def grid_normalization_and_gravity(
 def g2p(state: MPMStateStruct, model: MPMModelStruct, dt: float):
     p = wp.tid()
     if state.particle_selection[p] == 0:
-        if state.particle_material[p] == 7:  # stationary particles don't move
+        if state.particle_material[p] == 7 or state.particle_material[p] == 8:  # stationary/rigid handled separately
             return
         grid_pos = state.particle_x[p] * model.inv_dx
         base_pos_x = wp.int(grid_pos[0] - 0.5)
@@ -478,7 +478,7 @@ def compute_stress_from_F_trial(
             J = wp.determinant(state.particle_F_trial[p])
             Jcbr = J**(1.0 / 3.0)
             state.particle_F[p] = wp.mat33(Jcbr, 0.0, 0.0, 0.0, Jcbr, 0.0, 0.0, 0.0, Jcbr)
-        elif mat == 7:  # stationary
+        elif mat == 7 or mat == 8:  # stationary / rigid — no deformation
             state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         else:  # jelly (0), snow (4), or custom
             state.particle_F[p] = state.particle_F_trial[p]
@@ -643,4 +643,129 @@ def selection_enforce_particle_velocity_cylinder(state: MPMStateStruct, velocity
     else:
         velocity_modifier.mask[p] = 0
 
-        
+
+# ---------------------------------------------------------------------------
+# Rigid body kernels (material == 8)
+# ---------------------------------------------------------------------------
+
+@wp.kernel
+def rigid_g2p_accumulate(
+    state: MPMStateStruct,
+    model: MPMModelStruct,
+    rigid_x_cm: wp.array(dtype=wp.vec3),
+    rigid_linear_mom: wp.array(dtype=wp.vec3),
+    rigid_angular_mom: wp.array(dtype=wp.vec3),
+):
+    """For each rigid particle gather grid momentum and accumulate per-body
+    linear and angular momentum contributions."""
+    p = wp.tid()
+    if state.particle_selection[p] == 0 and state.particle_material[p] == 8:
+        bid = state.particle_rigid_id[p]
+
+        # standard quadratic B-spline weights (same as g2p)
+        grid_pos = state.particle_x[p] * model.inv_dx
+        base_x = wp.int(grid_pos[0] - 0.5)
+        base_y = wp.int(grid_pos[1] - 0.5)
+        base_z = wp.int(grid_pos[2] - 0.5)
+        fx = grid_pos - wp.vec3(wp.float(base_x), wp.float(base_y), wp.float(base_z))
+        wa = wp.vec3(1.5) - fx
+        wb = fx - wp.vec3(1.0)
+        wc = fx - wp.vec3(0.5)
+        w = wp.mat33(
+            wp.cw_mul(wa, wa) * 0.5,
+            wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
+            wp.cw_mul(wc, wc) * 0.5,
+        )
+
+        v_interp = wp.vec3(0.0)
+        for i in range(3):
+            for j in range(3):
+                for k in range(3):
+                    weight = w[0, i] * w[1, j] * w[2, k]
+                    v_interp = v_interp + state.grid_v_out[base_x + i, base_y + j, base_z + k] * weight
+
+        mass_p = state.particle_mass[p]
+        r = state.particle_x[p] - rigid_x_cm[bid]
+        wp.atomic_add(rigid_linear_mom, bid, v_interp * mass_p)
+        wp.atomic_add(rigid_angular_mom, bid, wp.cross(r, v_interp * mass_p))
+
+
+@wp.kernel
+def rigid_body_integrate(
+    rigid_x_cm: wp.array(dtype=wp.vec3),
+    rigid_v_cm: wp.array(dtype=wp.vec3),
+    rigid_omega: wp.array(dtype=wp.vec3),
+    rigid_orientation: wp.array(dtype=wp.mat33),
+    rigid_mass: wp.array(dtype=float),
+    rigid_inv_inertia_body: wp.array(dtype=wp.mat33),
+    rigid_linear_mom: wp.array(dtype=wp.vec3),
+    rigid_angular_mom: wp.array(dtype=wp.vec3),
+    dt: float,
+):
+    """Integrate rigid body EOM for body b (one thread per body).
+    Updates v_cm, omega, x_cm, and orientation."""
+    b = wp.tid()
+    R = rigid_orientation[b]
+    M = rigid_mass[b]
+
+    # --- linear ---
+    v_cm_new = rigid_linear_mom[b] / M
+
+    # --- angular ---
+    # I_world = R * I_body * R^T,  I_world_inv = R * I_body_inv * R^T
+    I_world_inv = R * rigid_inv_inertia_body[b] * wp.transpose(R)
+    omega_new = I_world_inv * rigid_angular_mom[b]
+
+    # --- position ---
+    x_cm_new = rigid_x_cm[b] + v_cm_new * dt
+
+    # --- orientation: first-order update then polar-decomp re-orthogonalisation ---
+    ox = omega_new[0]
+    oy = omega_new[1]
+    oz = omega_new[2]
+    skew_w = wp.mat33(0.0, -oz, oy,  oz, 0.0, -ox,  -oy, ox, 0.0)
+    R_new = R + skew_w * R * dt
+    U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    sig = wp.vec3(0.0)
+    wp.svd3(R_new, U, sig, V)
+    R_orth = U * wp.transpose(V)
+
+    rigid_v_cm[b] = v_cm_new
+    rigid_omega[b] = omega_new
+    rigid_x_cm[b] = x_cm_new
+    rigid_orientation[b] = R_orth
+
+
+@wp.kernel
+def rigid_particle_update(
+    state: MPMStateStruct,
+    rigid_x_cm: wp.array(dtype=wp.vec3),
+    rigid_v_cm: wp.array(dtype=wp.vec3),
+    rigid_omega: wp.array(dtype=wp.vec3),
+    rigid_orientation: wp.array(dtype=wp.mat33),
+):
+    """Set per-particle position, velocity, C, and F from rigid body state."""
+    p = wp.tid()
+    if state.particle_selection[p] == 0 and state.particle_material[p] == 8:
+        bid = state.particle_rigid_id[p]
+        R = rigid_orientation[bid]
+        x_cm = rigid_x_cm[bid]
+        v_cm = rigid_v_cm[bid]
+        omega = rigid_omega[bid]
+
+        x_p = x_cm + R * state.particle_x_ref[p]
+        r = x_p - x_cm
+
+        # velocity: v_cm + omega x r
+        state.particle_v[p] = v_cm + wp.cross(omega, r)
+        state.particle_x[p] = x_p
+
+        # C = skew(omega) so APIC scatter uses the correct linear velocity field
+        ox = omega[0]
+        oy = omega[1]
+        oz = omega[2]
+        state.particle_C[p] = wp.mat33(0.0, -oz, oy,  oz, 0.0, -ox,  -oy, ox, 0.0)
+
+        # rigid — no deformation
+        state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)

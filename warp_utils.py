@@ -60,7 +60,9 @@ class MPMStateStruct:
     particle_Jp: wp.array(dtype=float)
 
     particle_selection: wp.array(dtype=int) # only particle_selection[p] = 0 will be simulated
-    particle_material: wp.array(dtype=int)  # material type per particle (0=jelly,1=metal,2=sand,3=foam,4=snow,5=plasticine,6=fluid)
+    particle_material: wp.array(dtype=int)  # material type per particle (0=jelly,1=metal,2=sand,3=foam,4=snow,5=plasticine,6=fluid,7=stationary,8=rigid)
+    particle_rigid_id: wp.array(dtype=int)  # rigid body id for mat==8 particles; -1 for non-rigid
+    particle_x_ref: wp.array(dtype=wp.vec3) # body-frame reference position for rigid particles
 
     # grid
     grid_m: wp.array(dtype=float, ndim=3)

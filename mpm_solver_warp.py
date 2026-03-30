@@ -9,7 +9,7 @@ from mpm_utils import *
 
 MATERIAL_NAME_TO_ID = {
     "jelly": 0, "metal": 1, "sand": 2, "foam": 3,
-    "snow": 4, "plasticine": 5, "fluid": 6, "stationary": 7,
+    "snow": 4, "plasticine": 5, "fluid": 6, "stationary": 7, "rigid": 8,
 }
 MAX_MATERIALS = 16
 
@@ -131,6 +131,13 @@ class MPM_Simulator_WARP:
             shape=n_particles, dtype=int, device=device
         )  # default 0 = jelly
 
+        self.mpm_state.particle_rigid_id = wp.zeros(
+            shape=n_particles, dtype=int, device=device
+        )  # rigid body id; only meaningful when particle_material == 8
+        self.mpm_state.particle_x_ref = wp.zeros(
+            shape=n_particles, dtype=wp.vec3, device=device
+        )  # body-frame reference position for rigid particles
+
         self.mpm_state.grid_m = wp.zeros(
             shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
             dtype=float,
@@ -159,6 +166,20 @@ class MPM_Simulator_WARP:
 
         self.particle_velocity_modifiers = []
         self.particle_velocity_modifier_params = []
+
+        # surfaces that apply restitution impulses to rigid bodies
+        self.rigid_surface_colliders = []
+
+        # rigid body state (populated by initialize_rigid_bodies / finalize_rigid_bodies)
+        self.n_rigid_bodies = 0
+        self.rigid_x_cm = None
+        self.rigid_v_cm = None
+        self.rigid_omega = None
+        self.rigid_orientation = None
+        self.rigid_mass = None
+        self.rigid_inv_inertia_body = None
+        self._rigid_linear_mom = None   # per-step accumulation buffer
+        self._rigid_angular_mom = None  # per-step accumulation buffer
 
     # the h5 file should store particle initial position and volume.
     def load_from_sampling(
@@ -428,6 +449,170 @@ class MPM_Simulator_WARP:
     def set_gravity(self, g):
         self.mpm_model.gravitational_accelaration = wp.vec3(g[0], g[1], g[2])
 
+    # ------------------------------------------------------------------
+    # Rigid body API
+    # ------------------------------------------------------------------
+
+    def initialize_rigid_bodies(self, n_bodies, device="cuda:0"):
+        """Allocate per-body state arrays for n_bodies rigid bodies.
+        Call this before finalize_rigid_bodies()."""
+        self.n_rigid_bodies = n_bodies
+        self.rigid_x_cm = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self.rigid_v_cm = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self.rigid_omega = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self.rigid_orientation = wp.from_numpy(
+            np.tile(np.eye(3, dtype=np.float32), (n_bodies, 1, 1)).reshape(n_bodies, 3, 3),
+            dtype=wp.mat33, device=device,
+        )
+        self.rigid_mass = wp.zeros(n_bodies, dtype=float, device=device)
+        self.rigid_inv_inertia_body = wp.zeros(n_bodies, dtype=wp.mat33, device=device)
+        self._rigid_linear_mom = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self._rigid_angular_mom = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+
+    def finalize_rigid_bodies(self, device="cuda:0"):
+        """Compute center of mass, inertia tensor, and reference positions for
+        all rigid bodies from the current particle layout.  Must be called after
+        all set_parameters_for_particles() calls that assign material="rigid" and
+        obj_id, and before the first p2g2p() step."""
+        x_np = self.mpm_state.particle_x.numpy()          # (n, 3)
+        m_np = self.mpm_state.particle_mass.numpy()        # (n,)
+        mat_np = self.mpm_state.particle_material.numpy()  # (n,)
+        rid_np = self.mpm_state.particle_rigid_id.numpy()  # (n,)
+
+        # auto-detect number of rigid bodies from assigned obj_ids
+        rigid_mask = mat_np == 8
+        if not np.any(rigid_mask):
+            return
+        n_bodies = int(rid_np[rigid_mask].max()) + 1
+        self.initialize_rigid_bodies(n_bodies, device=device)
+
+        x_cm_np = np.zeros((self.n_rigid_bodies, 3), dtype=np.float32)
+        mass_np = np.zeros(self.n_rigid_bodies, dtype=np.float32)
+        for b in range(self.n_rigid_bodies):
+            idx = np.where((mat_np == 8) & (rid_np == b))[0]
+            m_b = m_np[idx]
+            mass_np[b] = float(m_b.sum())
+            x_cm_np[b] = (x_np[idx] * m_b[:, None]).sum(axis=0) / mass_np[b]
+
+        # inertia tensor in body frame (= world frame at t=0 since orientation = I)
+        I_body_inv_np = np.zeros((self.n_rigid_bodies, 3, 3), dtype=np.float32)
+        x_ref_np = np.zeros_like(x_np)
+        for b in range(self.n_rigid_bodies):
+            idx = np.where((mat_np == 8) & (rid_np == b))[0]
+            r = x_np[idx] - x_cm_np[b]          # (n_b, 3)
+            x_ref_np[idx] = r                    # body-frame reference positions
+            m_b = m_np[idx]
+            I = np.zeros((3, 3), dtype=np.float64)
+            for i, (ri, mi) in enumerate(zip(r, m_b)):
+                I += mi * (np.dot(ri, ri) * np.eye(3) - np.outer(ri, ri))
+            I_body_inv_np[b] = np.linalg.inv(I).astype(np.float32)
+
+        # push to GPU
+        self.rigid_x_cm = wp.from_numpy(x_cm_np, dtype=wp.vec3, device=device)
+        self.rigid_mass = wp.from_numpy(mass_np, dtype=float, device=device)
+        self.rigid_inv_inertia_body = wp.from_numpy(
+            I_body_inv_np.reshape(self.n_rigid_bodies, 3, 3), dtype=wp.mat33, device=device
+        )
+        self.mpm_state.particle_x_ref = wp.from_numpy(x_ref_np, dtype=wp.vec3, device=device)
+
+    def set_rigid_body_velocity(self, body_id, v_cm=(0, 0, 0), omega=(0, 0, 0), device="cuda:0"):
+        """Set the initial linear and angular velocity of a rigid body."""
+        v_np = wp.to_torch(self.rigid_v_cm)
+        o_np = wp.to_torch(self.rigid_omega)
+        v_np[body_id] = torch.tensor(v_cm, dtype=torch.float32)
+        o_np[body_id] = torch.tensor(omega, dtype=torch.float32)
+
+    def _apply_rigid_restitution(self, dt):
+        """Apply restitution impulses to rigid bodies for registered surfaces.
+        Must be called after rigid_body_integrate and before rigid_particle_update."""
+        if not self.rigid_surface_colliders or self.n_rigid_bodies == 0:
+            return
+
+        x_cm_np   = self.rigid_x_cm.numpy()              # (n_bodies, 3)
+        v_cm_np   = self.rigid_v_cm.numpy()              # (n_bodies, 3)
+        omega_np  = self.rigid_omega.numpy()             # (n_bodies, 3)
+        R_np      = self.rigid_orientation.numpy()       # (n_bodies, 3, 3)
+        M_np      = self.rigid_mass.numpy()              # (n_bodies,)
+        I_inv_np  = self.rigid_inv_inertia_body.numpy()  # (n_bodies, 3, 3)
+        x_ref_np  = self.mpm_state.particle_x_ref.numpy()       # (n_particles, 3)
+        mat_np    = self.mpm_state.particle_material.numpy()     # (n_particles,)
+        rid_np    = self.mpm_state.particle_rigid_id.numpy()     # (n_particles,)
+
+        modified = False
+        for b in range(self.n_rigid_bodies):
+            idx = np.where((mat_np == 8) & (rid_np == b))[0]
+            if len(idx) == 0:
+                continue
+
+            R     = R_np[b]       # (3, 3)
+            x_cm  = x_cm_np[b]   # (3,)
+            M     = float(M_np[b])
+            I_inv = I_inv_np[b]   # (3, 3)
+
+            # World-frame inverse inertia: I_world_inv = R * I_body_inv * R^T
+            I_world_inv = R @ I_inv @ R.T
+
+            # New particle world positions after rigid_body_integrate
+            x_refs  = x_ref_np[idx]              # (n_b, 3)
+            x_world = x_cm + (R @ x_refs.T).T   # (n_b, 3)
+
+            for surf in self.rigid_surface_colliders:
+                if self.time < surf["start_time"] or self.time >= surf["end_time"]:
+                    continue
+
+                pt = np.array(surf["point"],  dtype=np.float64)
+                n  = np.array(surf["normal"], dtype=np.float64)
+                e  = float(surf["restitution"])
+                mu = float(surf["friction"])
+
+                # Signed distance of each particle from the plane (negative = inside)
+                dists = (x_world - pt) @ n  # (n_b,)
+                min_i = int(np.argmin(dists))
+                if dists[min_i] >= 0.0:
+                    continue  # no penetration
+
+                # Contact point and lever arm
+                x_contact = x_world[min_i].astype(np.float64)
+                r = x_contact - x_cm.astype(np.float64)
+
+                # Contact velocity at the contact point
+                v_contact = v_cm_np[b].astype(np.float64) + np.cross(omega_np[b].astype(np.float64), r)
+                v_n = float(np.dot(v_contact, n))
+                if v_n >= 0.0:
+                    continue  # already separating
+
+                # Effective inverse mass at contact point along normal
+                r_cross_n = np.cross(r, n)
+                denom = 1.0 / M + np.dot(np.cross(I_world_inv @ r_cross_n, r), n)
+
+                # Normal impulse magnitude (positive = outward)
+                J_n = -(1.0 + e) * v_n / denom
+
+                # Apply normal impulse
+                v_cm_np[b]  = v_cm_np[b].astype(np.float64) + (J_n / M) * n
+                omega_np[b] = omega_np[b].astype(np.float64) + I_world_inv @ (J_n * r_cross_n)
+
+                # Friction impulse (Coulomb, opposing tangential contact velocity)
+                if mu > 0.0:
+                    v_t_vec = v_contact - v_n * n
+                    v_t_mag = float(np.linalg.norm(v_t_vec))
+                    if v_t_mag > 1e-10:
+                        t_hat = v_t_vec / v_t_mag
+                        r_cross_t = np.cross(r, t_hat)
+                        denom_t = 1.0 / M + np.dot(np.cross(I_world_inv @ r_cross_t, r), t_hat)
+                        # Impulse to fully stop sliding, capped by Coulomb limit
+                        J_t = min(v_t_mag / denom_t, mu * J_n)
+                        v_cm_np[b]  = v_cm_np[b] - (J_t / M) * t_hat
+                        omega_np[b] = omega_np[b] - I_world_inv @ (J_t * r_cross_t)
+
+                modified = True
+
+        if modified:
+            v_cm_torch    = wp.to_torch(self.rigid_v_cm)
+            omega_torch   = wp.to_torch(self.rigid_omega)
+            v_cm_torch[:] = torch.from_numpy(v_cm_np.astype(np.float32)).to(v_cm_torch.device)
+            omega_torch[:] = torch.from_numpy(omega_np.astype(np.float32)).to(omega_torch.device)
+
     def p2g2p(self, step, dt, device="cuda:0"):
         grid_size = (
             self.mpm_model.grid_dim_x,
@@ -535,6 +720,35 @@ class MPM_Simulator_WARP:
                 inputs=[self.mpm_state, self.mpm_model, dt],
                 device=device,
             )  # x, v, C, F_trial are updated
+
+        # rigid body step (skipped when no rigid bodies are present)
+        if self.n_rigid_bodies > 0:
+            with wp.ScopedTimer("rigid_body", synchronize=True, print=False, dict=self.time_profile):
+                # zero accumulation buffers
+                wp.launch(kernel=set_vec3_to_zero, dim=self.n_rigid_bodies,
+                          inputs=[self._rigid_linear_mom], device=device)
+                wp.launch(kernel=set_vec3_to_zero, dim=self.n_rigid_bodies,
+                          inputs=[self._rigid_angular_mom], device=device)
+                # gather grid momentum weighted by particle mass
+                wp.launch(kernel=rigid_g2p_accumulate, dim=self.n_particles,
+                          inputs=[self.mpm_state, self.mpm_model,
+                                  self.rigid_x_cm, self._rigid_linear_mom,
+                                  self._rigid_angular_mom],
+                          device=device)
+                # integrate rigid body EOM and update orientation
+                wp.launch(kernel=rigid_body_integrate, dim=self.n_rigid_bodies,
+                          inputs=[self.rigid_x_cm, self.rigid_v_cm, self.rigid_omega,
+                                  self.rigid_orientation, self.rigid_mass,
+                                  self.rigid_inv_inertia_body,
+                                  self._rigid_linear_mom, self._rigid_angular_mom, dt],
+                          device=device)
+                # apply restitution impulses to rigid bodies (surface colliders with e > 0)
+                self._apply_rigid_restitution(dt)
+                # push updated state back to particles
+                wp.launch(kernel=rigid_particle_update, dim=self.n_particles,
+                          inputs=[self.mpm_state, self.rigid_x_cm, self.rigid_v_cm,
+                                  self.rigid_omega, self.rigid_orientation],
+                          device=device)
 
         #### CFL check ####
         # particle_v = self.mpm_state.particle_v.numpy()
@@ -648,6 +862,11 @@ class MPM_Simulator_WARP:
             s_torch = wp.to_torch(self.mpm_model.softening)
             s_torch[mat_id] = params_dict["softening"]
 
+        # rigid body id — only meaningful when material == "rigid" (8)
+        if "obj_id" in params_dict:
+            rid_torch = wp.to_torch(self.mpm_state.particle_rigid_id)
+            rid_torch[start_idx:end_idx] = int(params_dict["obj_id"])
+
         # per-particle parameters (set for the range only)
         if "density" in params_dict:
             density_torch = wp.to_torch(self.mpm_state.particle_density)
@@ -757,6 +976,7 @@ class MPM_Simulator_WARP:
         normal,
         surface="sticky",
         friction=0.0,
+        restitution=0.0,
         start_time=0.0,
         end_time=999.0,
     ):
@@ -784,6 +1004,18 @@ class MPM_Simulator_WARP:
             collider_param.surface_type = 2
         # frictional
         collider_param.friction = friction
+
+        if restitution != 0.0:
+            if not (0.0 < restitution <= 1.0):
+                raise ValueError("restitution must be between 0 (exclusive) and 1 (inclusive).")
+            self.rigid_surface_colliders.append({
+                "point": list(point),
+                "normal": list(normal),
+                "friction": friction,
+                "restitution": restitution,
+                "start_time": start_time,
+                "end_time": end_time,
+            })
 
         self.collider_params.append(collider_param)
 
