@@ -1433,6 +1433,104 @@ class MPM_Simulator_WARP:
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
 
+    def add_sdf_collider(
+        self,
+        sdf_np,
+        origin,
+        dx_sdf,
+        surface="slip",
+        friction=0.0,
+        start_time=0.0,
+        end_time=999.0,
+        initial_translation=None,
+        initial_rotation=None,
+        device="cuda:0",
+    ):
+        """Add an SDF-based surface collider.
+
+        Parameters
+        ----------
+        sdf_np : numpy.ndarray, shape (nx, ny, nz), dtype float32
+            Signed distance field in the collider's local frame.
+            φ < 0 inside the object, φ > 0 outside.
+            Typical construction from an occupancy grid::
+
+                from scipy.ndimage import distance_transform_edt
+                d_out = distance_transform_edt(1 - occupancy) * dx_sdf
+                d_in  = distance_transform_edt(occupancy)     * dx_sdf
+                sdf_np = (d_out - d_in).astype(np.float32)
+
+        origin : array-like, length 3
+            World-space (or local-frame) position of sdf_np[0, 0, 0].
+        dx_sdf : float
+            Voxel size of the SDF grid.  Should be smaller than the MPM
+            grid spacing (``self.mpm_model.dx``) for sub-cell accuracy.
+        surface : str
+            ``'sticky'``, ``'slip'``, or ``'frictional'``.
+        friction : float
+            Coulomb friction coefficient (only used when surface='frictional').
+        start_time / end_time : float
+            Time window during which this collider is active.
+        initial_translation : array-like, length 3, optional
+            Initial world-space position of the object origin.
+            Defaults to (0, 0, 0) — use this when the SDF is already
+            expressed in world space.
+        initial_rotation : array-like, shape (3, 3), optional
+            Initial rotation matrix (object → world).
+            Defaults to the identity matrix.
+        device : str
+
+        Returns
+        -------
+        param : SDFCollider
+            The collider struct stored on the GPU.  Pass this to a
+            ``modify_bc`` callback to update ``translation`` and
+            ``rotation`` each substep for moving objects::
+
+                def move(time, dt, param):
+                    t, R = your_trajectory(time)
+                    param.translation = wp.vec3(*t)
+                    param.rotation    = wp.mat33(*R.flatten())
+        """
+        sdf_np = np.ascontiguousarray(sdf_np, dtype=np.float32)
+        nx, ny, nz = sdf_np.shape
+
+        if initial_translation is None:
+            initial_translation = [0.0, 0.0, 0.0]
+        if initial_rotation is None:
+            initial_rotation = np.eye(3, dtype=np.float32)
+        initial_rotation = np.asarray(initial_rotation, dtype=np.float32)
+
+        surface_map = {"sticky": 0, "slip": 1, "frictional": 2}
+        if surface not in surface_map:
+            raise ValueError(f"surface must be 'sticky', 'slip', or 'frictional', got '{surface}'")
+
+        param = SDFCollider()
+        param.sdf          = wp.from_numpy(sdf_np, dtype=float, device=device)
+        param.origin       = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
+        param.dx_sdf       = float(dx_sdf)
+        param.nx           = nx
+        param.ny           = ny
+        param.nz           = nz
+        param.surface_type = surface_map[surface]
+        param.friction     = float(friction)
+        param.start_time   = float(start_time)
+        param.end_time     = float(end_time)
+        param.translation  = wp.vec3(float(initial_translation[0]),
+                                     float(initial_translation[1]),
+                                     float(initial_translation[2]))
+        R = initial_rotation
+        param.rotation = wp.mat33(
+            float(R[0, 0]), float(R[0, 1]), float(R[0, 2]),
+            float(R[1, 0]), float(R[1, 1]), float(R[1, 2]),
+            float(R[2, 0]), float(R[2, 1]), float(R[2, 2]),
+        )
+
+        self.collider_params.append(param)
+        self.grid_postprocess.append(collide_sdf)
+        self.modify_bc.append(None)
+        return param
+
     # given normal direction, say [0,0,1]
     # gradually release grid velocities from start position to end position
     def release_particles_sequentially(self, normal, start_position, end_position, num_layers, start_time, end_time):

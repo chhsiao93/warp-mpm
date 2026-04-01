@@ -769,3 +769,133 @@ def rigid_particle_update(
 
         # rigid — no deformation
         state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# SDF collider helpers and kernel
+# ---------------------------------------------------------------------------
+
+@wp.func
+def sdf_sample(sdf: wp.array(dtype=float, ndim=3),
+               nx: int, ny: int, nz: int,
+               i: int, j: int, k: int) -> float:
+    """Nearest-neighbour SDF lookup with boundary clamping."""
+    i = wp.clamp(i, 0, nx - 1)
+    j = wp.clamp(j, 0, ny - 1)
+    k = wp.clamp(k, 0, nz - 1)
+    return sdf[i, j, k]
+
+
+@wp.func
+def sdf_query(sdf: wp.array(dtype=float, ndim=3),
+              origin: wp.vec3, dx_sdf: float,
+              nx: int, ny: int, nz: int,
+              world_pos: wp.vec3) -> float:
+    """Trilinearly interpolated SDF value at world_pos (in SDF local frame)."""
+    p  = (world_pos - origin) / dx_sdf
+    i  = int(p[0]);  j  = int(p[1]);  k  = int(p[2])
+    fx = p[0] - float(i)
+    fy = p[1] - float(j)
+    fz = p[2] - float(k)
+
+    c000 = sdf_sample(sdf, nx, ny, nz, i,   j,   k  )
+    c100 = sdf_sample(sdf, nx, ny, nz, i+1, j,   k  )
+    c010 = sdf_sample(sdf, nx, ny, nz, i,   j+1, k  )
+    c110 = sdf_sample(sdf, nx, ny, nz, i+1, j+1, k  )
+    c001 = sdf_sample(sdf, nx, ny, nz, i,   j,   k+1)
+    c101 = sdf_sample(sdf, nx, ny, nz, i+1, j,   k+1)
+    c011 = sdf_sample(sdf, nx, ny, nz, i,   j+1, k+1)
+    c111 = sdf_sample(sdf, nx, ny, nz, i+1, j+1, k+1)
+
+    c00 = c000 * (1.0 - fx) + c100 * fx
+    c10 = c010 * (1.0 - fx) + c110 * fx
+    c01 = c001 * (1.0 - fx) + c101 * fx
+    c11 = c011 * (1.0 - fx) + c111 * fx
+    c0  = c00  * (1.0 - fy) + c10  * fy
+    c1  = c01  * (1.0 - fy) + c11  * fy
+    return c0 * (1.0 - fz) + c1 * fz
+
+
+@wp.func
+def sdf_gradient(sdf: wp.array(dtype=float, ndim=3),
+                 origin: wp.vec3, dx_sdf: float,
+                 nx: int, ny: int, nz: int,
+                 local_pos: wp.vec3) -> wp.vec3:
+    """Central-difference gradient of SDF → outward surface normal (unit vector)."""
+    ex = wp.vec3(dx_sdf, 0.0, 0.0)
+    ey = wp.vec3(0.0, dx_sdf, 0.0)
+    ez = wp.vec3(0.0, 0.0, dx_sdf)
+    gx = (sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos + ex) -
+          sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos - ex)) / (2.0 * dx_sdf)
+    gy = (sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos + ey) -
+          sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos - ey)) / (2.0 * dx_sdf)
+    gz = (sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos + ez) -
+          sdf_query(sdf, origin, dx_sdf, nx, ny, nz, local_pos - ez)) / (2.0 * dx_sdf)
+    return wp.normalize(wp.vec3(gx, gy, gz))
+
+
+@wp.kernel
+def collide_sdf(
+    time:  float,
+    dt:    float,
+    state: MPMStateStruct,
+    model: MPMModelStruct,
+    param: SDFCollider,
+):
+    """Grid-level SDF collision kernel.
+
+    For each grid node, transforms the node's world position into the
+    collider's local frame, queries the SDF, and applies sticky / slip /
+    frictional velocity correction when the node is inside the object (φ < 0).
+    """
+    gx, gy, gz = wp.tid()
+    if time < param.start_time or time >= param.end_time:
+        return
+
+    # World position of this grid node
+    world_pos = wp.vec3(float(gx) * model.dx,
+                        float(gy) * model.dx,
+                        float(gz) * model.dx)
+
+    # Transform to SDF local frame: local = R^T (world - translation)
+    R_inv     = wp.transpose(param.rotation)
+    local_pos = R_inv * (world_pos - param.translation)
+
+    phi = sdf_query(param.sdf, param.origin, param.dx_sdf,
+                    param.nx, param.ny, param.nz, local_pos)
+
+    # Collision margin: one MPM grid cell outside the surface.
+    # Prevents fluid from tunneling through thin/rotating walls and corners.
+    margin = model.dx*2.0
+
+    if phi < margin:
+        # Outward normal in local frame → rotate to world frame
+        n_local = sdf_gradient(param.sdf, param.origin, param.dx_sdf,
+                               param.nx, param.ny, param.nz, local_pos)
+        n = wp.normalize(param.rotation * n_local)
+
+        v  = state.grid_v_out[gx, gy, gz]
+        vn = wp.dot(v, n)
+
+        if phi < 0.0:
+            # Fully inside solid: apply surface-type BC.
+            if param.surface_type == 0:
+                # Sticky: zero all velocity
+                state.grid_v_out[gx, gy, gz] = wp.vec3(0.0, 0.0, 0.0)
+
+            elif param.surface_type == 1:
+                # Slip: project out normal component entirely
+                state.grid_v_out[gx, gy, gz] = v - vn * n
+
+            else:
+                # Frictional: project out inward normal; apply Coulomb friction
+                v = v - wp.min(vn, 0.0) * n
+                if vn < 0.0 and wp.length(v) > 1e-20:
+                    v = wp.max(0.0, wp.length(v) + vn * param.friction) * wp.normalize(v)
+                state.grid_v_out[gx, gy, gz] = v
+
+        else:
+            # Margin zone (0 <= φ < dx): only block velocity moving INTO the surface.
+            # Nodes moving away are left untouched so fluid can escape freely.
+            if vn < 0.0:
+                state.grid_v_out[gx, gy, gz] = v - vn * n

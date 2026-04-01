@@ -113,6 +113,23 @@ class PointCloudCollider:
     end_time: float
 
 
+@wp.struct
+class SDFCollider:
+    sdf:          wp.array(dtype=float, ndim=3)  # φ values; negative inside object
+    origin:       wp.vec3    # world position of sdf[0,0,0]
+    dx_sdf:       float      # SDF voxel size (should be < MPM dx for sub-cell accuracy)
+    nx:           int
+    ny:           int
+    nz:           int
+    surface_type: int        # 0 = sticky, 1 = slip, 2 = frictional
+    friction:     float
+    start_time:   float
+    end_time:     float
+    # rigid-body transform (object frame → world frame); updated each substep for moving objects
+    translation:  wp.vec3    # world-space position of the object origin
+    rotation:     wp.mat33   # orthonormal rotation matrix (object → world)
+
+
 
 @wp.struct
 class Impulse_modifier:
