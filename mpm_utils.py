@@ -281,10 +281,10 @@ def compute_mu_lam_from_E_nu(state: MPMStateStruct, model: MPMModelStruct):
 
 @wp.kernel
 def zero_grid(state: MPMStateStruct, model: MPMModelStruct):
-    grid_x, grid_y, grid_z = wp.tid()
-    state.grid_m[grid_x, grid_y, grid_z] = 0.0
-    state.grid_v_in[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
-    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+    e, grid_x, grid_y, grid_z = wp.tid()
+    state.grid_m[e, grid_x, grid_y, grid_z] = 0.0
+    state.grid_v_in[e, grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
 
 
 @wp.func
@@ -329,6 +329,7 @@ def p2g_apic_with_stress(state: MPMStateStruct, model: MPMModelStruct, dt: float
     #                       particle_v
     #                       particle_C
     p = wp.tid()
+    e = p // model.n_particles_per_env  # environment index for this particle
     if state.particle_selection[p] == 0:
         stress = state.particle_stress[p]
         grid_pos = state.particle_x[p] * model.inv_dx
@@ -375,9 +376,9 @@ def p2g_apic_with_stress(state: MPMStateStruct, model: MPMModelStruct, dt: float
                         * (state.particle_v[p] + C * dpos)
                         + dt * elastic_force
                     )
-                    wp.atomic_add(state.grid_v_in, ix, iy, iz, v_in_add)
+                    wp.atomic_add(state.grid_v_in, e, ix, iy, iz, v_in_add)
                     wp.atomic_add(
-                        state.grid_m, ix, iy, iz, weight * state.particle_mass[p]
+                        state.grid_m, e, ix, iy, iz, weight * state.particle_mass[p]
                     )
 
 
@@ -386,19 +387,41 @@ def p2g_apic_with_stress(state: MPMStateStruct, model: MPMModelStruct, dt: float
 def grid_normalization_and_gravity(
     state: MPMStateStruct, model: MPMModelStruct, dt: float
 ):
-    grid_x, grid_y, grid_z = wp.tid()
-    if state.grid_m[grid_x, grid_y, grid_z] > 1e-15:
-        v_out = state.grid_v_in[grid_x, grid_y, grid_z] * (
-            1.0 / state.grid_m[grid_x, grid_y, grid_z]
+    e, grid_x, grid_y, grid_z = wp.tid()
+    if state.grid_m[e, grid_x, grid_y, grid_z] > 1e-15:
+        v_out = state.grid_v_in[e, grid_x, grid_y, grid_z] * (
+            1.0 / state.grid_m[e, grid_x, grid_y, grid_z]
         )
-        # add gravity
-        v_out = v_out + dt * model.gravitational_accelaration
-        state.grid_v_out[grid_x, grid_y, grid_z] = v_out
+        # per-env gravity (set via set_gravity() or set_gravity_per_env())
+        v_out = v_out + dt * model.gravity_per_env[e]
+        state.grid_v_out[e, grid_x, grid_y, grid_z] = v_out
+
+
+@wp.kernel
+def apply_external_force_per_env(state: MPMStateStruct, model: MPMModelStruct, dt: float):
+    """Apply a per-environment body force to all active, deformable particles.
+
+    Skips inactive particles (particle_selection != 0) and stationary/rigid
+    particles (material 7 or 8).  The force is specified in world units (N)
+    and is converted to a velocity impulse: dv = force / mass * dt.
+    """
+    p = wp.tid()
+    if state.particle_selection[p] != 0:
+        return
+    mat = state.particle_material[p]
+    if mat == 7 or mat == 8:
+        return
+    e = p // model.n_particles_per_env
+    f = state.external_force_per_env[e]
+    # Only apply if the force is non-trivially non-zero (cheap guard)
+    if wp.length(f) > 0.0:
+        state.particle_v[p] = state.particle_v[p] + f * (dt / state.particle_mass[p])
 
 
 @wp.kernel
 def g2p(state: MPMStateStruct, model: MPMModelStruct, dt: float):
     p = wp.tid()
+    e = p // model.n_particles_per_env  # environment index for this particle
     if state.particle_selection[p] == 0:
         if state.particle_material[p] == 7 or state.particle_material[p] == 8:  # stationary/rigid handled separately
             return
@@ -429,7 +452,7 @@ def g2p(state: MPMStateStruct, model: MPMModelStruct, dt: float):
                     iz = base_pos_z + k
                     dpos = wp.vec3(wp.float(i), wp.float(j), wp.float(k)) - fx
                     weight = w[0, i] * w[1, j] * w[2, k]  # tricubic interpolation
-                    grid_v = state.grid_v_out[ix, iy, iz]
+                    grid_v = state.grid_v_out[e, ix, iy, iz]
                     new_v = new_v + grid_v * weight
                     new_C = new_C + wp.outer(grid_v, dpos) * (
                         weight * model.inv_dx * 4.0
@@ -571,9 +594,9 @@ def compute_R_from_F(state: MPMStateStruct, model: MPMModelStruct):
 
 @wp.kernel
 def add_damping_via_grid(state: MPMStateStruct, scale: float):
-    grid_x, grid_y, grid_z = wp.tid()
-    state.grid_v_out[grid_x, grid_y, grid_z] = (
-        state.grid_v_out[grid_x, grid_y, grid_z] * scale
+    e, grid_x, grid_y, grid_z = wp.tid()
+    state.grid_v_out[e, grid_x, grid_y, grid_z] = (
+        state.grid_v_out[e, grid_x, grid_y, grid_z] * scale
     )
 
 
@@ -659,6 +682,7 @@ def rigid_g2p_accumulate(
     """For each rigid particle gather grid momentum and accumulate per-body
     linear and angular momentum contributions."""
     p = wp.tid()
+    e = p // model.n_particles_per_env  # environment index for this particle
     if state.particle_selection[p] == 0 and state.particle_material[p] == 8:
         bid = state.particle_rigid_id[p]
 
@@ -682,12 +706,13 @@ def rigid_g2p_accumulate(
             for j in range(3):
                 for k in range(3):
                     weight = w[0, i] * w[1, j] * w[2, k]
-                    v_interp = v_interp + state.grid_v_out[base_x + i, base_y + j, base_z + k] * weight
+                    v_interp = v_interp + state.grid_v_out[e, base_x + i, base_y + j, base_z + k] * weight
 
+        b_flat = e * model.n_rigid_bodies_per_env + bid
         mass_p = state.particle_mass[p]
-        r = state.particle_x[p] - rigid_x_cm[bid]
-        wp.atomic_add(rigid_linear_mom, bid, v_interp * mass_p)
-        wp.atomic_add(rigid_angular_mom, bid, wp.cross(r, v_interp * mass_p))
+        r = state.particle_x[p] - rigid_x_cm[b_flat]
+        wp.atomic_add(rigid_linear_mom, b_flat, v_interp * mass_p)
+        wp.atomic_add(rigid_angular_mom, b_flat, wp.cross(r, v_interp * mass_p))
 
 
 @wp.kernel
@@ -740,6 +765,7 @@ def rigid_body_integrate(
 @wp.kernel
 def rigid_particle_update(
     state: MPMStateStruct,
+    model: MPMModelStruct,
     rigid_x_cm: wp.array(dtype=wp.vec3),
     rigid_v_cm: wp.array(dtype=wp.vec3),
     rigid_omega: wp.array(dtype=wp.vec3),
@@ -749,10 +775,12 @@ def rigid_particle_update(
     p = wp.tid()
     if state.particle_selection[p] == 0 and state.particle_material[p] == 8:
         bid = state.particle_rigid_id[p]
-        R = rigid_orientation[bid]
-        x_cm = rigid_x_cm[bid]
-        v_cm = rigid_v_cm[bid]
-        omega = rigid_omega[bid]
+        e = p // model.n_particles_per_env
+        b_flat = e * model.n_rigid_bodies_per_env + bid
+        R = rigid_orientation[b_flat]
+        x_cm = rigid_x_cm[b_flat]
+        v_cm = rigid_v_cm[b_flat]
+        omega = rigid_omega[b_flat]
 
         x_p = x_cm + R * state.particle_x_ref[p]
         r = x_p - x_cm
@@ -769,6 +797,106 @@ def rigid_particle_update(
 
         # rigid — no deformation
         state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
+
+
+@wp.kernel
+def rigid_collide_planes_kernel(
+    particle_x_ref: wp.array(dtype=wp.vec3),
+    rigid_particle_indices: wp.array(dtype=int),
+    rigid_body_particle_start: wp.array(dtype=int),
+    rigid_body_particle_end: wp.array(dtype=int),
+    rigid_x_cm: wp.array(dtype=wp.vec3),
+    rigid_v_cm: wp.array(dtype=wp.vec3),
+    rigid_omega: wp.array(dtype=wp.vec3),
+    rigid_orientation: wp.array(dtype=wp.mat33),
+    rigid_mass: wp.array(dtype=float),
+    rigid_inv_inertia_body: wp.array(dtype=wp.mat33),
+    surf_point: wp.array(dtype=wp.vec3),
+    surf_normal: wp.array(dtype=wp.vec3),
+    surf_restitution: wp.array(dtype=float),
+    surf_friction: wp.array(dtype=float),
+    surf_start_time: wp.array(dtype=float),
+    surf_end_time: wp.array(dtype=float),
+    n_surfaces: int,
+    current_time: float,
+    dt: float,
+):
+    """One thread per rigid body (across all envs).
+
+    Uses a pre-built compact index list (rigid_particle_indices) so the inner
+    loop only iterates over the few rigid particles belonging to each body,
+    not over all particles in the env.
+
+    Impulses from multiple surfaces are accumulated in local registers and
+    written back once — no atomics needed."""
+    b_flat = wp.tid()
+
+    x_cm        = rigid_x_cm[b_flat]
+    R           = rigid_orientation[b_flat]
+    M           = rigid_mass[b_flat]
+    I_inv       = rigid_inv_inertia_body[b_flat]
+    I_world_inv = R * I_inv * wp.transpose(R)
+
+    # Read current velocities into local vars; accumulate all surface impulses
+    v_cm  = rigid_v_cm[b_flat]
+    omega = rigid_omega[b_flat]
+
+    k_start = rigid_body_particle_start[b_flat]
+    k_end   = rigid_body_particle_end[b_flat]
+
+    for s in range(n_surfaces):
+        if current_time < surf_start_time[s] or current_time >= surf_end_time[s]:
+            continue
+
+        pt      = surf_point[s]
+        n_hat   = surf_normal[s]
+        coeff_e = surf_restitution[s]
+        mu      = surf_friction[s]
+
+        # Find the deepest penetrating rigid particle for this body
+        min_dist    = float(1.0e10)
+        min_x_world = wp.vec3(0.0, 0.0, 0.0)
+
+        for k in range(k_start, k_end):
+            p       = rigid_particle_indices[k]
+            x_world = x_cm + R * particle_x_ref[p]
+            dist    = wp.dot(x_world - pt, n_hat)
+            if dist < min_dist:
+                min_dist    = dist
+                min_x_world = x_world
+
+        if min_dist >= 0.0:
+            continue  # no penetration
+
+        r         = min_x_world - x_cm
+        v_contact = v_cm + wp.cross(omega, r)
+        v_n       = wp.dot(v_contact, n_hat)
+
+        if v_n >= 0.0:
+            continue  # already separating
+
+        r_cross_n = wp.cross(r, n_hat)
+        denom     = (1.0 / M) + wp.dot(wp.cross(I_world_inv * r_cross_n, r), n_hat)
+        J_n       = -(1.0 + coeff_e) * v_n / denom
+
+        v_cm  = v_cm  + n_hat * (J_n / M)
+        omega = omega + I_world_inv * r_cross_n * J_n
+
+        # Coulomb friction impulse
+        if mu > 0.0:
+            v_t_vec = v_contact - v_n * n_hat
+            v_t_mag = wp.length(v_t_vec)
+            if v_t_mag > 1.0e-10:
+                t_hat     = v_t_vec * (1.0 / v_t_mag)
+                r_cross_t = wp.cross(r, t_hat)
+                denom_t   = (1.0 / M) + wp.dot(wp.cross(I_world_inv * r_cross_t, r), t_hat)
+                J_t       = wp.min(v_t_mag / denom_t, mu * J_n)
+                v_cm  = v_cm  - t_hat * (J_t / M)
+                omega = omega - I_world_inv * r_cross_t * J_t
+
+    # Write accumulated velocities back once — one thread per body, no races
+    rigid_v_cm[b_flat]  = v_cm
+    rigid_omega[b_flat] = omega
 
 
 # ---------------------------------------------------------------------------
@@ -848,11 +976,11 @@ def collide_sdf(
     collider's local frame, queries the SDF, and applies sticky / slip /
     frictional velocity correction when the node is inside the object (φ < 0).
     """
-    gx, gy, gz = wp.tid()
+    e, gx, gy, gz = wp.tid()
     if time < param.start_time or time >= param.end_time:
         return
 
-    # World position of this grid node
+    # World position of this grid node (same domain for all envs)
     world_pos = wp.vec3(float(gx) * model.dx,
                         float(gy) * model.dx,
                         float(gz) * model.dx)
@@ -874,28 +1002,28 @@ def collide_sdf(
                                param.nx, param.ny, param.nz, local_pos)
         n = wp.normalize(param.rotation * n_local)
 
-        v  = state.grid_v_out[gx, gy, gz]
+        v  = state.grid_v_out[e, gx, gy, gz]
         vn = wp.dot(v, n)
 
         if phi < 0.0:
             # Fully inside solid: apply surface-type BC.
             if param.surface_type == 0:
                 # Sticky: zero all velocity
-                state.grid_v_out[gx, gy, gz] = wp.vec3(0.0, 0.0, 0.0)
+                state.grid_v_out[e, gx, gy, gz] = wp.vec3(0.0, 0.0, 0.0)
 
             elif param.surface_type == 1:
                 # Slip: project out normal component entirely
-                state.grid_v_out[gx, gy, gz] = v - vn * n
+                state.grid_v_out[e, gx, gy, gz] = v - vn * n
 
             else:
                 # Frictional: project out inward normal; apply Coulomb friction
                 v = v - wp.min(vn, 0.0) * n
                 if vn < 0.0 and wp.length(v) > 1e-20:
                     v = wp.max(0.0, wp.length(v) + vn * param.friction) * wp.normalize(v)
-                state.grid_v_out[gx, gy, gz] = v
+                state.grid_v_out[e, gx, gy, gz] = v
 
         else:
             # Margin zone (0 <= φ < dx): only block velocity moving INTO the surface.
             # Nodes moving away are left untouched so fluid can escape freely.
             if vn < 0.0:
-                state.grid_v_out[gx, gy, gz] = v - vn * n
+                state.grid_v_out[e, gx, gy, gz] = v - vn * n

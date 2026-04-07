@@ -15,12 +15,18 @@ MAX_MATERIALS = 16
 
 
 class MPM_Simulator_WARP:
-    def __init__(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0"):
-        self.initialize(n_particles, n_grid, grid_lim, device=device)
+    def __init__(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0", n_envs=1):
+        self.initialize(n_particles, n_grid, grid_lim, device=device, n_envs=n_envs)
         self.time_profile = {}
 
-    def initialize(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0"):
+    def initialize(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0", n_envs=1):
         self.n_particles = n_particles
+        # Multi-env support: n_particles is the TOTAL across all environments.
+        # n_particles_per_env = n_particles // n_envs (must divide evenly).
+        assert n_particles % n_envs == 0, \
+            f"n_particles ({n_particles}) must be divisible by n_envs ({n_envs})"
+        self.n_envs = n_envs
+        self.n_particles_per_env = n_particles // n_envs
 
         self.mpm_model = MPMModelStruct()
         # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
@@ -31,6 +37,9 @@ class MPM_Simulator_WARP:
         self.mpm_model.grid_dim_x = self.mpm_model.n_grid
         self.mpm_model.grid_dim_y = self.mpm_model.n_grid
         self.mpm_model.grid_dim_z = self.mpm_model.n_grid
+        self.mpm_model.n_envs = n_envs
+        self.mpm_model.n_particles_per_env = self.n_particles_per_env
+        self.mpm_model.n_rigid_bodies_per_env = 0  # set by initialize_rigid_bodies
         (
             self.mpm_model.dx,
             self.mpm_model.inv_dx,
@@ -68,6 +77,10 @@ class MPM_Simulator_WARP:
                   inputs=[self.mpm_model.softening, 0.1], device=device)
 
         self.mpm_model.gravitational_accelaration = wp.vec3(0.0, 0.0, 0.0)
+
+        # per-env gravity — initialised to zero; broadcast via set_gravity() or
+        # per-env via set_gravity_per_env().
+        self.mpm_model.gravity_per_env = wp.zeros(shape=n_envs, dtype=wp.vec3, device=device)
 
         self.mpm_model.rpic_damping = 0.0  # 0.0 if no damping (apic). -1 if pic
 
@@ -138,18 +151,24 @@ class MPM_Simulator_WARP:
             shape=n_particles, dtype=wp.vec3, device=device
         )  # body-frame reference position for rigid particles
 
+        # per-env external body force (RL actions); zero until explicitly set
+        self.mpm_state.external_force_per_env = wp.zeros(
+            shape=n_envs, dtype=wp.vec3, device=device
+        )
+
+        _g = self.mpm_model.n_grid
         self.mpm_state.grid_m = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(n_envs, _g, _g, _g),
             dtype=float,
             device=device,
         )
         self.mpm_state.grid_v_in = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(n_envs, _g, _g, _g),
             dtype=wp.vec3,
             device=device,
         )
         self.mpm_state.grid_v_out = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(n_envs, _g, _g, _g),
             dtype=wp.vec3,
             device=device,
         )
@@ -172,6 +191,14 @@ class MPM_Simulator_WARP:
 
         # rigid body state (populated by initialize_rigid_bodies / finalize_rigid_bodies)
         self.n_rigid_bodies = 0
+        self.n_rigid_bodies_per_env = 0
+        # Compact per-body particle index list (built in finalize_rigid_bodies)
+        self._rigid_particle_indices = None      # flat array: all rigid particle global indices
+        self._rigid_body_particle_start = None   # start index in _rigid_particle_indices for each body
+        self._rigid_body_particle_end = None     # end index (exclusive) for each body
+        # GPU copies of rigid surface collider data (uploaded once in _upload_rigid_surface_colliders)
+        self._rigid_surf_uploaded = False        # True once the GPU arrays match rigid_surface_colliders
+        self._rigid_surf_points = None           # surf point positions on GPU
         self.rigid_x_cm = None
         self.rigid_v_cm = None
         self.rigid_omega = None
@@ -233,6 +260,7 @@ class MPM_Simulator_WARP:
         print("Total particles: ", self.n_particles)
 
     # shape of tensor_x is (n, 3); shape of tensor_volume is (n,)
+    # n is the TOTAL particle count across all environments (= n_envs * n_particles_per_env)
     def load_initial_data_from_torch(
         self,
         tensor_x,
@@ -241,11 +269,12 @@ class MPM_Simulator_WARP:
         n_grid=100,
         grid_lim=1.0,
         device="cuda:0",
+        n_envs=1,
     ):
         self.dim, self.n_particles = tensor_x.shape[1], tensor_x.shape[0]
         assert tensor_x.shape[0] == tensor_volume.shape[0]
         # assert tensor_x.shape[0] == tensor_cov.reshape(-1, 6).shape[0]
-        self.initialize(self.n_particles, n_grid, grid_lim, device=device)
+        self.initialize(self.n_particles, n_grid, grid_lim, device=device, n_envs=n_envs)
 
         self.import_particle_x_from_torch(tensor_x, device)
         self.mpm_state.particle_vol = wp.from_numpy(
@@ -318,18 +347,19 @@ class MPM_Simulator_WARP:
         ) = self.mpm_model.grid_lim / self.mpm_model.n_grid, float(
             self.mpm_model.n_grid / self.mpm_model.grid_lim
         )
+        _g = self.mpm_model.n_grid
         self.mpm_state.grid_m = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(self.n_envs, _g, _g, _g),
             dtype=float,
             device=device,
         )
         self.mpm_state.grid_v_in = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(self.n_envs, _g, _g, _g),
             dtype=wp.vec3,
             device=device,
         )
         self.mpm_state.grid_v_out = wp.zeros(
-            shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
+            shape=(self.n_envs, _g, _g, _g),
             dtype=wp.vec3,
             device=device,
         )
@@ -447,174 +477,272 @@ class MPM_Simulator_WARP:
         self.finalize_mu_lam(device=device)
 
     def set_gravity(self, g):
-        self.mpm_model.gravitational_accelaration = wp.vec3(g[0], g[1], g[2])
+        """Set the same gravity for all environments (backward-compatible)."""
+        gv = wp.vec3(float(g[0]), float(g[1]), float(g[2]))
+        self.mpm_model.gravitational_accelaration = gv  # kept for reference
+        g_torch = wp.to_torch(self.mpm_model.gravity_per_env)
+        g_torch[:] = torch.tensor([g[0], g[1], g[2]], dtype=torch.float32,
+                                   device=g_torch.device)
+
+    def set_gravity_per_env(self, env_idx: int, g):
+        """Set gravity for a single environment (0-indexed).
+
+        Args:
+            env_idx: environment index in [0, n_envs)
+            g: sequence of 3 floats [gx, gy, gz]
+        """
+        assert 0 <= env_idx < self.n_envs, f"env_idx {env_idx} out of range [0, {self.n_envs})"
+        g_torch = wp.to_torch(self.mpm_model.gravity_per_env)
+        g_torch[env_idx] = torch.tensor([g[0], g[1], g[2]], dtype=torch.float32,
+                                         device=g_torch.device)
+
+    def set_gravity_all_envs(self, g_tensor):
+        """Set gravity for all environments from a (E, 3) or (3,) tensor.
+
+        Args:
+            g_tensor: torch.Tensor, shape (E, 3) for per-env gravity,
+                      or shape (3,) to broadcast to all envs.
+        """
+        g_tensor = g_tensor.float()
+        if g_tensor.ndim == 1:
+            g_tensor = g_tensor.unsqueeze(0).expand(self.n_envs, 3).contiguous()
+        assert g_tensor.shape == (self.n_envs, 3), \
+            f"Expected shape ({self.n_envs}, 3), got {g_tensor.shape}"
+        g_torch = wp.to_torch(self.mpm_model.gravity_per_env)
+        g_torch[:] = g_tensor.to(g_torch.device)
+
+    # ------------------------------------------------------------------
+    # Per-env external force API  (RL actions)
+    # ------------------------------------------------------------------
+
+    def set_env_external_force(self, env_idx: int, force, device="cuda:0"):
+        """Set a body force (N) applied to all active deformable particles in env_idx.
+
+        The force persists until changed.  Call with force=[0,0,0] to clear.
+
+        Args:
+            env_idx: environment index in [0, n_envs)
+            force: sequence of 3 floats [fx, fy, fz] in Newtons
+        """
+        assert 0 <= env_idx < self.n_envs, f"env_idx {env_idx} out of range [0, {self.n_envs})"
+        f_torch = wp.to_torch(self.mpm_state.external_force_per_env)
+        f_torch[env_idx] = torch.tensor([force[0], force[1], force[2]],
+                                         dtype=torch.float32, device=f_torch.device)
+
+    def set_env_external_force_all(self, force_tensor, device="cuda:0"):
+        """Set external body forces for all environments at once.
+
+        Typical RL usage — call this every step before p2g2p() with the
+        policy action output:
+
+            solver.set_env_external_force_all(actions)  # (E, 3)
+            solver.p2g2p(step, dt)
+
+        Args:
+            force_tensor: torch.Tensor shape (E, 3) — force in Newtons per env,
+                          or shape (3,) to broadcast to all envs.
+        """
+        force_tensor = force_tensor.float()
+        if force_tensor.ndim == 1:
+            force_tensor = force_tensor.unsqueeze(0).expand(self.n_envs, 3).contiguous()
+        assert force_tensor.shape == (self.n_envs, 3), \
+            f"Expected shape ({self.n_envs}, 3), got {force_tensor.shape}"
+        f_torch = wp.to_torch(self.mpm_state.external_force_per_env)
+        f_torch[:] = force_tensor.to(f_torch.device)
+
+    def clear_env_external_force(self, device="cuda:0"):
+        """Zero all per-env external forces."""
+        wp.launch(kernel=set_vec3_to_zero,
+                  dim=self.n_envs,
+                  inputs=[self.mpm_state.external_force_per_env],
+                  device=device)
 
     # ------------------------------------------------------------------
     # Rigid body API
     # ------------------------------------------------------------------
 
-    def initialize_rigid_bodies(self, n_bodies, device="cuda:0"):
-        """Allocate per-body state arrays for n_bodies rigid bodies.
+    def initialize_rigid_bodies(self, n_bodies_per_env, device="cuda:0"):
+        """Allocate per-body state arrays for n_bodies_per_env rigid bodies per environment.
+        Total body arrays have shape (n_envs * n_bodies_per_env,).
         Call this before finalize_rigid_bodies()."""
-        self.n_rigid_bodies = n_bodies
-        self.rigid_x_cm = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
-        self.rigid_v_cm = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
-        self.rigid_omega = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self.n_rigid_bodies_per_env = n_bodies_per_env
+        self.n_rigid_bodies = self.n_envs * n_bodies_per_env
+        self.mpm_model.n_rigid_bodies_per_env = n_bodies_per_env
+        n_total = self.n_rigid_bodies
+        self.rigid_x_cm = wp.zeros(n_total, dtype=wp.vec3, device=device)
+        self.rigid_v_cm = wp.zeros(n_total, dtype=wp.vec3, device=device)
+        self.rigid_omega = wp.zeros(n_total, dtype=wp.vec3, device=device)
         self.rigid_orientation = wp.from_numpy(
-            np.tile(np.eye(3, dtype=np.float32), (n_bodies, 1, 1)).reshape(n_bodies, 3, 3),
+            np.tile(np.eye(3, dtype=np.float32), (n_total, 1, 1)).reshape(n_total, 3, 3),
             dtype=wp.mat33, device=device,
         )
-        self.rigid_mass = wp.zeros(n_bodies, dtype=float, device=device)
-        self.rigid_inv_inertia_body = wp.zeros(n_bodies, dtype=wp.mat33, device=device)
-        self._rigid_linear_mom = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
-        self._rigid_angular_mom = wp.zeros(n_bodies, dtype=wp.vec3, device=device)
+        self.rigid_mass = wp.zeros(n_total, dtype=float, device=device)
+        self.rigid_inv_inertia_body = wp.zeros(n_total, dtype=wp.mat33, device=device)
+        self._rigid_linear_mom = wp.zeros(n_total, dtype=wp.vec3, device=device)
+        self._rigid_angular_mom = wp.zeros(n_total, dtype=wp.vec3, device=device)
 
     def finalize_rigid_bodies(self, device="cuda:0"):
         """Compute center of mass, inertia tensor, and reference positions for
         all rigid bodies from the current particle layout.  Must be called after
         all set_parameters_for_particles() calls that assign material="rigid" and
-        obj_id, and before the first p2g2p() step."""
-        x_np = self.mpm_state.particle_x.numpy()          # (n, 3)
-        m_np = self.mpm_state.particle_mass.numpy()        # (n,)
-        mat_np = self.mpm_state.particle_material.numpy()  # (n,)
-        rid_np = self.mpm_state.particle_rigid_id.numpy()  # (n,)
+        obj_id, and before the first p2g2p() step.
 
-        # auto-detect number of rigid bodies from assigned obj_ids
+        particle_rigid_id[p] stores the LOCAL body id within its environment (0-based).
+        Body arrays are laid out flat as [env0_body0, env0_body1, ..., env1_body0, ...].
+        """
+        P = self.n_particles_per_env
+        x_np = self.mpm_state.particle_x.numpy()          # (E*P, 3)
+        m_np = self.mpm_state.particle_mass.numpy()        # (E*P,)
+        mat_np = self.mpm_state.particle_material.numpy()  # (E*P,)
+        rid_np = self.mpm_state.particle_rigid_id.numpy()  # (E*P,) — local body id per env
+
         rigid_mask = mat_np == 8
         if not np.any(rigid_mask):
             return
-        n_bodies = int(rid_np[rigid_mask].max()) + 1
-        self.initialize_rigid_bodies(n_bodies, device=device)
 
-        x_cm_np = np.zeros((self.n_rigid_bodies, 3), dtype=np.float32)
-        mass_np = np.zeros(self.n_rigid_bodies, dtype=np.float32)
-        for b in range(self.n_rigid_bodies):
-            idx = np.where((mat_np == 8) & (rid_np == b))[0]
-            m_b = m_np[idx]
-            mass_np[b] = float(m_b.sum())
-            x_cm_np[b] = (x_np[idx] * m_b[:, None]).sum(axis=0) / mass_np[b]
+        # auto-detect n_bodies_per_env from env 0 (all envs must have the same layout)
+        env0_mask = rigid_mask[:P]
+        n_bodies_per_env = int(rid_np[:P][env0_mask].max()) + 1 if np.any(env0_mask) else 0
+        if n_bodies_per_env == 0:
+            return
+        self.initialize_rigid_bodies(n_bodies_per_env, device=device)
 
-        # inertia tensor in body frame (= world frame at t=0 since orientation = I)
-        I_body_inv_np = np.zeros((self.n_rigid_bodies, 3, 3), dtype=np.float32)
+        n_total = self.n_rigid_bodies  # = n_envs * n_bodies_per_env
+        x_cm_np = np.zeros((n_total, 3), dtype=np.float32)
+        mass_np = np.zeros(n_total, dtype=np.float32)
+        I_body_inv_np = np.zeros((n_total, 3, 3), dtype=np.float32)
         x_ref_np = np.zeros_like(x_np)
-        for b in range(self.n_rigid_bodies):
-            idx = np.where((mat_np == 8) & (rid_np == b))[0]
-            r = x_np[idx] - x_cm_np[b]          # (n_b, 3)
-            x_ref_np[idx] = r                    # body-frame reference positions
-            m_b = m_np[idx]
-            I = np.zeros((3, 3), dtype=np.float64)
-            for i, (ri, mi) in enumerate(zip(r, m_b)):
-                I += mi * (np.dot(ri, ri) * np.eye(3) - np.outer(ri, ri))
-            I_body_inv_np[b] = np.linalg.inv(I).astype(np.float32)
 
-        # push to GPU
+        for e in range(self.n_envs):
+            p_start = e * P
+            p_end = p_start + P
+            mat_e = mat_np[p_start:p_end]
+            rid_e = rid_np[p_start:p_end]
+            x_e = x_np[p_start:p_end]
+            m_e = m_np[p_start:p_end]
+
+            for b_local in range(n_bodies_per_env):
+                b_flat = e * n_bodies_per_env + b_local
+                idx = np.where((mat_e == 8) & (rid_e == b_local))[0]
+                if len(idx) == 0:
+                    continue
+                m_b = m_e[idx]
+                mass_np[b_flat] = float(m_b.sum())
+                x_cm_np[b_flat] = (x_e[idx] * m_b[:, None]).sum(axis=0) / mass_np[b_flat]
+
+                # inertia tensor in body frame (= world frame at t=0, orientation = I)
+                r = x_e[idx] - x_cm_np[b_flat]
+                x_ref_np[p_start + idx] = r  # body-frame reference positions
+                I = np.zeros((3, 3), dtype=np.float64)
+                for ri, mi in zip(r, m_b):
+                    I += mi * (np.dot(ri, ri) * np.eye(3) - np.outer(ri, ri))
+                I_body_inv_np[b_flat] = np.linalg.inv(I).astype(np.float32)
+
+        # push rigid body state to GPU
         self.rigid_x_cm = wp.from_numpy(x_cm_np, dtype=wp.vec3, device=device)
         self.rigid_mass = wp.from_numpy(mass_np, dtype=float, device=device)
         self.rigid_inv_inertia_body = wp.from_numpy(
-            I_body_inv_np.reshape(self.n_rigid_bodies, 3, 3), dtype=wp.mat33, device=device
+            I_body_inv_np.reshape(n_total, 3, 3), dtype=wp.mat33, device=device
         )
         self.mpm_state.particle_x_ref = wp.from_numpy(x_ref_np, dtype=wp.vec3, device=device)
 
-    def set_rigid_body_velocity(self, body_id, v_cm=(0, 0, 0), omega=(0, 0, 0), device="cuda:0"):
-        """Set the initial linear and angular velocity of a rigid body."""
-        v_np = wp.to_torch(self.rigid_v_cm)
-        o_np = wp.to_torch(self.rigid_omega)
-        v_np[body_id] = torch.tensor(v_cm, dtype=torch.float32)
-        o_np[body_id] = torch.tensor(omega, dtype=torch.float32)
+        # Build compact per-body particle index lists for the GPU collision kernel.
+        # Iterating only over rigid particles (instead of all env particles) keeps
+        # the kernel fast even for single-env simulations.
+        all_indices = []
+        body_p_start_np = np.zeros(n_total, dtype=np.int32)
+        body_p_end_np   = np.zeros(n_total, dtype=np.int32)
+        for e in range(self.n_envs):
+            p_start_e = e * P
+            mat_e = mat_np[p_start_e : p_start_e + P]
+            rid_e = rid_np[p_start_e : p_start_e + P]
+            for b_local in range(n_bodies_per_env):
+                b_flat = e * n_bodies_per_env + b_local
+                local_idx = np.where((mat_e == 8) & (rid_e == b_local))[0]
+                global_idx = (local_idx + p_start_e).astype(np.int32)
+                body_p_start_np[b_flat] = len(all_indices)
+                all_indices.extend(global_idx.tolist())
+                body_p_end_np[b_flat] = len(all_indices)
 
-    def _apply_rigid_restitution(self, dt):
-        """Apply restitution impulses to rigid bodies for registered surfaces.
-        Must be called after rigid_body_integrate and before rigid_particle_update."""
+        indices_np = np.array(all_indices, dtype=np.int32) if all_indices else np.zeros(1, dtype=np.int32)
+        self._rigid_particle_indices    = wp.from_numpy(indices_np,       dtype=int, device=device)
+        self._rigid_body_particle_start = wp.from_numpy(body_p_start_np,  dtype=int, device=device)
+        self._rigid_body_particle_end   = wp.from_numpy(body_p_end_np,    dtype=int, device=device)
+
+    def set_rigid_body_velocity(self, body_id, v_cm=(0, 0, 0), omega=(0, 0, 0), env_id=0, device="cuda:0"):
+        """Set the linear and angular velocity of a rigid body and immediately
+        propagate the new velocity to the body's particles so the next P2G step
+        carries the correct momentum.
+
+        body_id: LOCAL body id within the environment (0-based).
+        env_id:  which environment to target (default 0)."""
+        b_flat  = env_id * self.n_rigid_bodies_per_env + body_id
+        v_t = wp.to_torch(self.rigid_v_cm)
+        o_t = wp.to_torch(self.rigid_omega)
+        v_t[b_flat] = torch.tensor(v_cm,   dtype=torch.float32, device=v_t.device)
+        o_t[b_flat] = torch.tensor(omega,  dtype=torch.float32, device=o_t.device)
+        # Propagate new velocity to per-particle arrays so that P2G in the next
+        # step scatters the correct momentum to the grid.
+        self.sync_rigid_particle_state(device=device)
+
+    def _upload_rigid_surface_colliders(self, device):
+        """Upload rigid surface collider data to GPU once.
+        Called automatically before the first simulation step that needs it."""
+        surfs = self.rigid_surface_colliders
+        if not surfs:
+            return
+        pts   = np.array([s["point"]       for s in surfs], dtype=np.float32)
+        nors  = np.array([s["normal"]      for s in surfs], dtype=np.float32)
+        rest  = np.array([s["restitution"] for s in surfs], dtype=np.float32)
+        fric  = np.array([s["friction"]    for s in surfs], dtype=np.float32)
+        t0    = np.array([s["start_time"]  for s in surfs], dtype=np.float32)
+        t1    = np.array([s["end_time"]    for s in surfs], dtype=np.float32)
+        self._rigid_surf_points      = wp.from_numpy(pts,  dtype=wp.vec3, device=device)
+        self._rigid_surf_normals     = wp.from_numpy(nors, dtype=wp.vec3, device=device)
+        self._rigid_surf_restitutions = wp.from_numpy(rest, dtype=float,  device=device)
+        self._rigid_surf_frictions   = wp.from_numpy(fric, dtype=float,  device=device)
+        self._rigid_surf_start_times = wp.from_numpy(t0,   dtype=float,  device=device)
+        self._rigid_surf_end_times   = wp.from_numpy(t1,   dtype=float,  device=device)
+        self._rigid_surf_uploaded = True
+
+    def _apply_rigid_restitution(self, dt, device="cuda:0"):
+        """Apply restitution impulses to rigid bodies via GPU kernel.
+        Surface data is uploaded to GPU once on first call and reused every step."""
         if not self.rigid_surface_colliders or self.n_rigid_bodies == 0:
             return
+        if not self._rigid_surf_uploaded:
+            self._upload_rigid_surface_colliders(device)
+        wp.launch(
+            kernel=rigid_collide_planes_kernel,
+            dim=self.n_rigid_bodies,
+            inputs=[
+                self.mpm_state.particle_x_ref,
+                self._rigid_particle_indices,
+                self._rigid_body_particle_start,
+                self._rigid_body_particle_end,
+                self.rigid_x_cm, self.rigid_v_cm, self.rigid_omega,
+                self.rigid_orientation, self.rigid_mass, self.rigid_inv_inertia_body,
+                self._rigid_surf_points, self._rigid_surf_normals,
+                self._rigid_surf_restitutions, self._rigid_surf_frictions,
+                self._rigid_surf_start_times, self._rigid_surf_end_times,
+                len(self.rigid_surface_colliders), self.time, dt,
+            ],
+            device=device,
+        )
 
-        x_cm_np   = self.rigid_x_cm.numpy()              # (n_bodies, 3)
-        v_cm_np   = self.rigid_v_cm.numpy()              # (n_bodies, 3)
-        omega_np  = self.rigid_omega.numpy()             # (n_bodies, 3)
-        R_np      = self.rigid_orientation.numpy()       # (n_bodies, 3, 3)
-        M_np      = self.rigid_mass.numpy()              # (n_bodies,)
-        I_inv_np  = self.rigid_inv_inertia_body.numpy()  # (n_bodies, 3, 3)
-        x_ref_np  = self.mpm_state.particle_x_ref.numpy()       # (n_particles, 3)
-        mat_np    = self.mpm_state.particle_material.numpy()     # (n_particles,)
-        rid_np    = self.mpm_state.particle_rigid_id.numpy()     # (n_particles,)
-
-        modified = False
-        for b in range(self.n_rigid_bodies):
-            idx = np.where((mat_np == 8) & (rid_np == b))[0]
-            if len(idx) == 0:
-                continue
-
-            R     = R_np[b]       # (3, 3)
-            x_cm  = x_cm_np[b]   # (3,)
-            M     = float(M_np[b])
-            I_inv = I_inv_np[b]   # (3, 3)
-
-            # World-frame inverse inertia: I_world_inv = R * I_body_inv * R^T
-            I_world_inv = R @ I_inv @ R.T
-
-            # New particle world positions after rigid_body_integrate
-            x_refs  = x_ref_np[idx]              # (n_b, 3)
-            x_world = x_cm + (R @ x_refs.T).T   # (n_b, 3)
-
-            for surf in self.rigid_surface_colliders:
-                if self.time < surf["start_time"] or self.time >= surf["end_time"]:
-                    continue
-
-                pt = np.array(surf["point"],  dtype=np.float64)
-                n  = np.array(surf["normal"], dtype=np.float64)
-                e  = float(surf["restitution"])
-                mu = float(surf["friction"])
-
-                # Signed distance of each particle from the plane (negative = inside)
-                dists = (x_world - pt) @ n  # (n_b,)
-                min_i = int(np.argmin(dists))
-                if dists[min_i] >= 0.0:
-                    continue  # no penetration
-
-                # Contact point and lever arm
-                x_contact = x_world[min_i].astype(np.float64)
-                r = x_contact - x_cm.astype(np.float64)
-
-                # Contact velocity at the contact point
-                v_contact = v_cm_np[b].astype(np.float64) + np.cross(omega_np[b].astype(np.float64), r)
-                v_n = float(np.dot(v_contact, n))
-                if v_n >= 0.0:
-                    continue  # already separating
-
-                # Effective inverse mass at contact point along normal
-                r_cross_n = np.cross(r, n)
-                denom = 1.0 / M + np.dot(np.cross(I_world_inv @ r_cross_n, r), n)
-
-                # Normal impulse magnitude (positive = outward)
-                J_n = -(1.0 + e) * v_n / denom
-
-                # Apply normal impulse
-                v_cm_np[b]  = v_cm_np[b].astype(np.float64) + (J_n / M) * n
-                omega_np[b] = omega_np[b].astype(np.float64) + I_world_inv @ (J_n * r_cross_n)
-
-                # Friction impulse (Coulomb, opposing tangential contact velocity)
-                if mu > 0.0:
-                    v_t_vec = v_contact - v_n * n
-                    v_t_mag = float(np.linalg.norm(v_t_vec))
-                    if v_t_mag > 1e-10:
-                        t_hat = v_t_vec / v_t_mag
-                        r_cross_t = np.cross(r, t_hat)
-                        denom_t = 1.0 / M + np.dot(np.cross(I_world_inv @ r_cross_t, r), t_hat)
-                        # Impulse to fully stop sliding, capped by Coulomb limit
-                        J_t = min(v_t_mag / denom_t, mu * J_n)
-                        v_cm_np[b]  = v_cm_np[b] - (J_t / M) * t_hat
-                        omega_np[b] = omega_np[b] - I_world_inv @ (J_t * r_cross_t)
-
-                modified = True
-
-        if modified:
-            v_cm_torch    = wp.to_torch(self.rigid_v_cm)
-            omega_torch   = wp.to_torch(self.rigid_omega)
-            v_cm_torch[:] = torch.from_numpy(v_cm_np.astype(np.float32)).to(v_cm_torch.device)
-            omega_torch[:] = torch.from_numpy(omega_np.astype(np.float32)).to(omega_torch.device)
+    def sync_rigid_particle_state(self, device="cuda:0"):
+        """Push current rigid body state (x_cm, v_cm, omega, orientation) into
+        per-particle arrays.  Call this once after finalize_rigid_bodies() and
+        any set_rigid_body_velocity() calls, before the first p2g2p() step."""
+        if self.n_rigid_bodies > 0:
+            wp.launch(kernel=rigid_particle_update, dim=self.n_particles,
+                      inputs=[self.mpm_state, self.mpm_model, self.rigid_x_cm, self.rigid_v_cm,
+                               self.rigid_omega, self.rigid_orientation],
+                      device=device)
 
     def p2g2p(self, step, dt, device="cuda:0"):
         grid_size = (
+            self.n_envs,
             self.mpm_model.grid_dim_x,
             self.mpm_model.grid_dim_y,
             self.mpm_model.grid_dim_z,
@@ -642,6 +770,14 @@ class MPM_Simulator_WARP:
                 inputs=[self.time, self.mpm_state, self.particle_velocity_modifier_params[k]],
                 device=device,
             )
+
+        # apply per-env external body force (RL actions) to particle velocities
+        wp.launch(
+            kernel=apply_external_force_per_env,
+            dim=self.n_particles,
+            inputs=[self.mpm_state, self.mpm_model, dt],
+            device=device,
+        )
 
         # compute stress = stress(returnMap(F_trial))
         with wp.ScopedTimer(
@@ -743,10 +879,10 @@ class MPM_Simulator_WARP:
                                   self._rigid_linear_mom, self._rigid_angular_mom, dt],
                           device=device)
                 # apply restitution impulses to rigid bodies (surface colliders with e > 0)
-                self._apply_rigid_restitution(dt)
+                self._apply_rigid_restitution(dt, device=device)
                 # push updated state back to particles
                 wp.launch(kernel=rigid_particle_update, dim=self.n_particles,
-                          inputs=[self.mpm_state, self.rigid_x_cm, self.rigid_v_cm,
+                          inputs=[self.mpm_state, self.mpm_model, self.rigid_x_cm, self.rigid_v_cm,
                                   self.rigid_omega, self.rigid_orientation],
                           device=device)
 
@@ -1016,6 +1152,7 @@ class MPM_Simulator_WARP:
                 "start_time": start_time,
                 "end_time": end_time,
             })
+            self._rigid_surf_uploaded = False  # will be re-uploaded before first use
 
         self.collider_params.append(collider_param)
 
@@ -1027,7 +1164,7 @@ class MPM_Simulator_WARP:
             model: MPMModelStruct,
             param: Dirichlet_collider,
         ):
-            grid_x, grid_y, grid_z = wp.tid()
+            e, grid_x, grid_y, grid_z = wp.tid()
             if time >= param.start_time and time < param.end_time:
                 offset = wp.vec3(
                     float(grid_x) * model.dx - param.point[0],
@@ -1039,7 +1176,7 @@ class MPM_Simulator_WARP:
 
                 if dotproduct < 0.0:
                     if param.surface_type == 0:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
                             0.0, 0.0, 0.0
                         )
                     elif param.surface_type == 11:
@@ -1047,16 +1184,16 @@ class MPM_Simulator_WARP:
                             float(grid_z) * model.dx < 0.4
                             or float(grid_z) * model.dx > 0.53
                         ):
-                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                            state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
                                 0.0, 0.0, 0.0
                             )
                         else:
-                            v_in = state.grid_v_out[grid_x, grid_y, grid_z]
-                            state.grid_v_out[grid_x, grid_y, grid_z] = (
+                            v_in = state.grid_v_out[e, grid_x, grid_y, grid_z]
+                            state.grid_v_out[e, grid_x, grid_y, grid_z] = (
                                 wp.vec3(v_in[0], 0.0, v_in[2]) * 0.3
                             )
                     else:
-                        v = state.grid_v_out[grid_x, grid_y, grid_z]
+                        v = state.grid_v_out[e, grid_x, grid_y, grid_z]
                         normal_component = wp.dot(v, n)
                         if param.surface_type == 1:
                             v = (
@@ -1072,7 +1209,7 @@ class MPM_Simulator_WARP:
                             ) * wp.normalize(
                                 v
                             )  # apply friction here
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
                             v[0], v[1], v[2]
                         )
 
@@ -1116,7 +1253,7 @@ class MPM_Simulator_WARP:
             model: MPMModelStruct,
             param: Dirichlet_collider,
         ):
-            grid_x, grid_y, grid_z = wp.tid()
+            e, grid_x, grid_y, grid_z = wp.tid()
             if time >= param.start_time and time < param.end_time:
                 offset = wp.vec3(
                     float(grid_x) * model.dx - param.point[0],
@@ -1128,10 +1265,10 @@ class MPM_Simulator_WARP:
                     and wp.abs(offset[1]) < param.size[1]
                     and wp.abs(offset[2]) < param.size[2]
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = param.velocity
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = param.velocity
             elif param.reset == 1:
                 if time < param.end_time + 15.0 * dt:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
 
         def modify(time, dt, param: Dirichlet_collider):
             if time >= param.start_time and time < param.end_time:
@@ -1159,54 +1296,54 @@ class MPM_Simulator_WARP:
             model: MPMModelStruct,
             param: Dirichlet_collider,
         ):
-            grid_x, grid_y, grid_z = wp.tid()
+            e, grid_x, grid_y, grid_z = wp.tid()
             padding = 3
             if time >= param.start_time and time < param.end_time:
-                if grid_x < padding and state.grid_v_out[grid_x, grid_y, grid_z][0] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                if grid_x < padding and state.grid_v_out[e, grid_x, grid_y, grid_z][0] < 0:
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][1],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][2],
                     )
                 if (
                     grid_x >= model.grid_dim_x - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][0] > 0
+                    and state.grid_v_out[e, grid_x, grid_y, grid_z][0] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][1],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][2],
                     )
 
-                if grid_y < padding and state.grid_v_out[grid_x, grid_y, grid_z][1] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
+                if grid_y < padding and state.grid_v_out[e, grid_x, grid_y, grid_z][1] < 0:
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][0],
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][2],
                     )
                 if (
                     grid_y >= model.grid_dim_y - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][1] > 0
+                    and state.grid_v_out[e, grid_x, grid_y, grid_z][1] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][0],
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][2],
                     )
 
-                if grid_z < padding and state.grid_v_out[grid_x, grid_y, grid_z][2] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
+                if grid_z < padding and state.grid_v_out[e, grid_x, grid_y, grid_z][2] < 0:
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][0],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][1],
                         0.0,
                     )
                 if (
                     grid_z >= model.grid_dim_z - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][2] > 0
+                    and state.grid_v_out[e, grid_x, grid_y, grid_z][2] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][0],
+                        state.grid_v_out[e, grid_x, grid_y, grid_z][1],
                         0.0,
                     )
 
@@ -1425,10 +1562,10 @@ class MPM_Simulator_WARP:
             model: MPMModelStruct,
             param: PointCloudCollider,
         ):
-            grid_x, grid_y, grid_z = wp.tid()
+            e, grid_x, grid_y, grid_z = wp.tid()
             if time >= param.start_time and time < param.end_time:
                 if param.occupancy_grid[grid_x, grid_y, grid_z] == 1:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                    state.grid_v_out[e, grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
 
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)

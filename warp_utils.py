@@ -14,6 +14,9 @@ class MPMModelStruct:
     grid_dim_x: int
     grid_dim_y: int
     grid_dim_z: int
+    n_envs: int             # number of parallel environments (1 = single-env, backward compat)
+    n_particles_per_env: int  # particles per environment = n_particles // n_envs
+    n_rigid_bodies_per_env: int  # rigid bodies per environment (0 = no rigid bodies)
     mu: wp.array(dtype=float)
     lam: wp.array(dtype=float)
     E: wp.array(dtype=float)
@@ -34,6 +37,11 @@ class MPMModelStruct:
     ####### for damping
     rpic_damping: float
     grid_v_damping_scale: float
+
+    ####### per-environment gravity (shape n_envs)
+    # gravity_per_env[e] overrides gravitational_accelaration for env e.
+    # Broadcast set_gravity() writes to all entries; set_gravity_per_env() writes one.
+    gravity_per_env: wp.array(dtype=wp.vec3)
 
     ####### for PhysGaussian: covariance
     update_cov_with_F: int
@@ -64,11 +72,16 @@ class MPMStateStruct:
     particle_rigid_id: wp.array(dtype=int)  # rigid body id for mat==8 particles; -1 for non-rigid
     particle_x_ref: wp.array(dtype=wp.vec3) # body-frame reference position for rigid particles
 
-    # grid
-    grid_m: wp.array(dtype=float, ndim=3)
-    grid_v_in: wp.array(dtype=wp.vec3, ndim=3)  # grid node momentum/velocity
+    # per-environment external body force (shape n_envs); applied to all active
+    # non-stationary/non-rigid particles before P2G each step.
+    # Zero by default. Set via solver.set_env_external_force() each step for RL actions.
+    external_force_per_env: wp.array(dtype=wp.vec3)
+
+    # grid — shape (n_envs, n_grid, n_grid, n_grid)
+    grid_m: wp.array(dtype=float, ndim=4)
+    grid_v_in: wp.array(dtype=wp.vec3, ndim=4)  # grid node momentum/velocity
     grid_v_out: wp.array(
-        dtype=wp.vec3, ndim=3
+        dtype=wp.vec3, ndim=4
     )  # grid node momentum/velocity, after grid update
 
 
