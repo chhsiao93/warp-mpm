@@ -1581,6 +1581,7 @@ class MPM_Simulator_WARP:
         end_time=999.0,
         initial_translation=None,
         initial_rotation=None,
+        margin=None,
         device="cuda:0",
     ):
         """Add an SDF-based surface collider.
@@ -1662,6 +1663,9 @@ class MPM_Simulator_WARP:
             float(R[1, 0]), float(R[1, 1]), float(R[1, 2]),
             float(R[2, 0]), float(R[2, 1]), float(R[2, 2]),
         )
+        param.linear_velocity  = wp.vec3(0.0, 0.0, 0.0)
+        param.angular_velocity = wp.vec3(0.0, 0.0, 0.0)
+        param.margin = float(margin) if margin is not None else float(self.mpm_model.dx)
 
         self.collider_params.append(param)
         self.grid_postprocess.append(collide_sdf)

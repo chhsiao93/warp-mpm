@@ -921,7 +921,18 @@ def sdf_query(sdf: wp.array(dtype=float, ndim=3),
               world_pos: wp.vec3) -> float:
     """Trilinearly interpolated SDF value at world_pos (in SDF local frame)."""
     p  = (world_pos - origin) / dx_sdf
+
+    # Out-of-bounds check on continuous coords: if the position is outside
+    # [origin, origin + (n-1)*dx_sdf] in any axis, return large positive phi
+    # so no collision is triggered.  We check continuous p here (before int())
+    # because int() in Warp truncates toward zero, so p[0] in [-1, 0) gives
+    # i=0 and a negative fractional weight, causing extrapolation rather than
+    # interpolation and producing phi < boundary value.
+    if p[0] < 0.0 or p[0] >= float(nx - 1) or p[1] < 0.0 or p[1] >= float(ny - 1) or p[2] < 0.0 or p[2] >= float(nz - 1):
+        return float(1.0e10)
+
     i  = int(p[0]);  j  = int(p[1]);  k  = int(p[2])
+
     fx = p[0] - float(i)
     fy = p[1] - float(j)
     fz = p[2] - float(k)
@@ -992,9 +1003,7 @@ def collide_sdf(
     phi = sdf_query(param.sdf, param.origin, param.dx_sdf,
                     param.nx, param.ny, param.nz, local_pos)
 
-    # Collision margin: one MPM grid cell outside the surface.
-    # Prevents fluid from tunneling through thin/rotating walls and corners.
-    margin = model.dx*2.0
+    margin = param.margin
 
     if phi < margin:
         # Outward normal in local frame → rotate to world frame
@@ -1005,25 +1014,37 @@ def collide_sdf(
         v  = state.grid_v_out[e, gx, gy, gz]
         vn = wp.dot(v, n)
 
+        # Surface velocity of the collider at this grid node:
+        #   v_surf = v_linear + ω × (world_pos - translation)
+        r = world_pos - param.translation
+        v_surf = param.linear_velocity + wp.cross(param.angular_velocity, r)
+        vn_surf = wp.dot(v_surf, n)
+
         if phi < 0.0:
             # Fully inside solid: apply surface-type BC.
             if param.surface_type == 0:
-                # Sticky: zero all velocity
-                state.grid_v_out[e, gx, gy, gz] = wp.vec3(0.0, 0.0, 0.0)
+                # Sticky: match surface velocity exactly
+                state.grid_v_out[e, gx, gy, gz] = v_surf
 
             elif param.surface_type == 1:
-                # Slip: project out normal component entirely
-                state.grid_v_out[e, gx, gy, gz] = v - vn * n
+                # Slip: enforce v·n >= v_surf·n, keep tangential component of grid velocity
+                if vn < vn_surf:
+                    state.grid_v_out[e, gx, gy, gz] = v + (vn_surf - vn) * n
 
             else:
-                # Frictional: project out inward normal; apply Coulomb friction
-                v = v - wp.min(vn, 0.0) * n
-                if vn < 0.0 and wp.length(v) > 1e-20:
-                    v = wp.max(0.0, wp.length(v) + vn * param.friction) * wp.normalize(v)
-                state.grid_v_out[e, gx, gy, gz] = v
+                # Frictional: enforce normal, apply Coulomb friction on tangential relative velocity
+                v_rel = v - v_surf
+                vn_rel = wp.dot(v_rel, n)
+                if vn_rel < 0.0:
+                    v_rel_t = v_rel - vn_rel * n   # tangential relative velocity (normal already removed)
+                    v_rel_t_len = wp.length(v_rel_t)
+                    if v_rel_t_len > 1e-20:
+                        friction_impulse = wp.min(param.friction * wp.abs(vn_rel), v_rel_t_len)
+                        v_rel_t = v_rel_t * (1.0 - friction_impulse / v_rel_t_len)
+                    v = v_surf + v_rel_t  # surface velocity + corrected tangential relative velocity
+                    state.grid_v_out[e, gx, gy, gz] = v
 
         else:
-            # Margin zone (0 <= φ < dx): only block velocity moving INTO the surface.
-            # Nodes moving away are left untouched so fluid can escape freely.
-            if vn < 0.0:
-                state.grid_v_out[e, gx, gy, gz] = v - vn * n
+            # Margin zone (0 <= φ < margin): only push if surface is moving outward faster than grid.
+            if vn < vn_surf:
+                state.grid_v_out[e, gx, gy, gz] = v + (vn_surf - vn) * n

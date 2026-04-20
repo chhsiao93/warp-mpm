@@ -139,8 +139,11 @@ class SDFCollider:
     start_time:   float
     end_time:     float
     # rigid-body transform (object frame → world frame); updated each substep for moving objects
-    translation:  wp.vec3    # world-space position of the object origin
-    rotation:     wp.mat33   # orthonormal rotation matrix (object → world)
+    translation:      wp.vec3    # world-space position of the object origin
+    rotation:         wp.mat33   # orthonormal rotation matrix (object → world)
+    linear_velocity:  wp.vec3    # world-space linear velocity of the object origin
+    angular_velocity: wp.vec3    # world-space angular velocity (ω), so v_surface = linear_velocity + ω × r
+    margin:           float      # collision activation distance outside surface (world units); default = model.dx
 
 
 
